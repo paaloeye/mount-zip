@@ -19,7 +19,8 @@ DEST = mount-zip
 PREFIX = $(DESTDIR)/usr
 BINDIR = $(PREFIX)/bin
 PKG_CONFIG ?= pkg-config
-DEPS = libzip icu-uc icu-i18n
+DEPS = libzip
+LDFLAGS += -licui18n-chrome -licuuc-chrome
 LDFLAGS += -Llib -lmountzip
 
 FUSE_MAJOR_VERSION ?= 3
@@ -79,7 +80,6 @@ $(MAN): README.md
 
 install: $(DEST)
 	$(INSTALL) -D "$(DEST)" "$(BINDIR)/$(DEST)"
-	$(INSTALL) -D -m 644 $(MAN) "$(MANDIR)/$(MAN)"
 
 install-strip: $(DEST)
 	$(INSTALL) -D -s "$(DEST)" "$(BINDIR)/$(DEST)"
