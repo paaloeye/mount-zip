@@ -599,11 +599,11 @@ Be cautious with this option since it can cause **mount-zip** to use a lot of
 memory.
 
 You can preemtively cache data at mount time by using the `-o precache` option.
-The cost of decompression in incurred upfront, and this ensures that any
-subsequent access to the mounted data is fast.
+The cost of decompression is incurred upfront, and this ensures that any
+subsequent access to the served data is fast.
 
 If **mount-zip** cannot create and expand the cache file, or if it was passed
-the `-o nocache` option, it will do its best using a small rolling buffer in
+the `-o nocache` option, it will do its best by using a small rolling buffer in
 memory. However, some data access patterns might then result in poor
 performance, especially if **mount-zip** has to repeatedly extract the same
 file.
