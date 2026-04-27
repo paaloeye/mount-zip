@@ -16,15 +16,24 @@
 
 #include "node.h"
 
+#include <algorithm>
 #include <cassert>
 #include <ctime>
 #include <memory>
 #include <vector>
 
+#include <boost/container_hash/hash.hpp>
+
 #include <zip.h>
 
 #include "error.h"
 #include "extra_field.h"
+
+HashedStringView::HashedStringView(std::string_view s) : string(s), hash(0) {
+  for (const char c : s) {
+    boost::hash_combine(hash, c);
+  }
+}
 
 std::ostream& operator<<(std::ostream& out, const FileType t) {
   switch (t) {
@@ -242,6 +251,42 @@ std::string Node::GetPath() const {
   assert(nodes.empty());
   assert(path.size() == n);
   return path;
+}
+
+bool Node::HasPath(std::string_view path) const {
+  if (!parent) {
+    return path == "/";
+  }
+
+  if (path.size() != path_length) {
+    return false;
+  }
+
+  if (!path.ends_with(name)) {
+    return false;
+  }
+
+  return parent->HasPath(
+      path.substr(0, path_length - name.size() - (parent->parent ? 1 : 0)));
+}
+
+void Node::ComputePathHash() {
+  path_length = 0;
+  path_hash = 0;
+
+  if (parent) {
+    path_length = parent->path_length;
+    path_hash = parent->path_hash;
+    if (parent->parent) {
+      ++path_length;
+      boost::hash_combine(path_hash, '/');
+    }
+  }
+
+  path_length += name.size();
+  for (const char c : name) {
+    boost::hash_combine(path_hash, c);
+  }
 }
 
 void Node::AddChild(Node* const child) {

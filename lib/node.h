@@ -38,6 +38,14 @@
 
 namespace bi = boost::intrusive;
 
+struct HashedStringView {
+  std::string_view string;
+  size_t hash;
+
+  HashedStringView(std::string_view s);
+  HashedStringView(std::string_view s, size_t h) : string(s), hash(h) {}
+};
+
 enum class FileType : mode_t {
   Unknown = 0,            // Unknown
   BlockDevice = S_IFBLK,  // Block-oriented device
@@ -76,8 +84,19 @@ struct Node {
   static bool original_permissions;
   static ino_t ino_count;
 
-  // Reference to the ZIP archive.
-  zip_t* zip = nullptr;
+#ifdef NDEBUG
+  using LinkMode = bi::link_mode<bi::normal_link>;
+#else
+  using LinkMode = bi::link_mode<bi::safe_link>;
+#endif
+
+  // --- 16-byte members (Highest alignment) ---
+
+  timespec mtime = g_now;
+  timespec atime = g_now;
+  timespec ctime = g_now;
+
+  // --- 8-byte members (Fixed size) ---
 
   // Index of the entry represented by this node in the ZIP archive, or -1 if it
   // is not directly represented in the ZIP archive (like the root directory, or
@@ -86,20 +105,14 @@ struct Node {
 
   // Inode-specific data.
   ino_t const ino = ++ino_count;
-  mutable nlink_t nlink = 1;
-  mode_t mode = 0;
-  uid_t uid = g_uid;
-  gid_t gid = g_gid;
-  dev_t dev = 0;
   zip_uint64_t size = 0;
-  timespec mtime = g_now;
-  timespec atime = g_now;
-  timespec ctime = g_now;
+  dev_t dev = 0;
 
-  // Link target (e.g. for symlinks or hardlinks)
-  std::string target;
-  mutable Reader::Ptr cached_reader;
-  static const blksize_t block_size = 512;
+  // --- Architecture-dependent members (8 bytes on 64-bit, 4 bytes on 32-bit)
+  // --- Grouped in even numbers to maintain 8-byte alignment on 32-bit systems.
+
+  // Reference to the ZIP archive.
+  zip_t* zip = nullptr;
 
   // If this Node is a hardlink, this points to the target node.
   Node* hardlink_target = nullptr;
@@ -108,23 +121,12 @@ struct Node {
   // root directory which has a null parent pointer.
   Node* parent = nullptr;
 
-  // Name of this node in the context of its parent. This name should be a valid
-  // and non-empty filename, and it shouldn't contain any '/' separator. The
-  // only exception is the root directory, which is just named "/".
-  std::string name;
+  mutable Reader::Ptr cached_reader;
 
-  // Original path as recorded in the ZIP archive. This is used to find hardlink
-  // targets.
-  std::string_view original_path;
+  size_t path_length = 0;
+  size_t path_hash = 0;
 
-  // Number of entries whose name have initially collided with this node.
-  int collision_count = 0;
-
-#ifdef NDEBUG
-  using LinkMode = bi::link_mode<bi::normal_link>;
-#else
-  using LinkMode = bi::link_mode<bi::safe_link>;
-#endif
+  // --- Intrusive Hooks (8-24 bytes on 64-bit, 4-12 bytes on 32-bit) ---
 
   // Hook used to index Nodes by parent.
   using ByParent = bi::slist_member_hook<LinkMode>;
@@ -141,8 +143,28 @@ struct Node {
   Children children;
 
   // Hooks used to index Nodes by full path and by original path.
-  using ByPath = bi::unordered_set_member_hook<LinkMode, bi::store_hash<true>>;
-  ByPath by_path, by_original_path;
+  using ByPath = bi::unordered_set_member_hook<LinkMode, bi::store_hash<false>>;
+  ByPath by_path;
+
+  // --- Remaining members (Strings and 4-byte types) ---
+
+  // Name of this node in the context of its parent. This name should be a valid
+  // and non-empty filename, and it shouldn't contain any '/' separator. The
+  // only exception is the root directory, which is just named "/".
+  std::string name;
+
+  // Link target (e.g. for symlinks or hardlinks).
+  std::string target;
+
+  uid_t uid = g_uid;
+  gid_t gid = g_gid;
+  mode_t mode = 0;
+  mutable nlink_t nlink = 1;
+
+  // Number of entries whose name have initially collided with this node.
+  int collision_count = 0;
+
+  static const blksize_t block_size = 512;
 
   // Methods.
   const Node& GetTarget() const {
@@ -158,7 +180,8 @@ struct Node {
 
   // Gets the full absolute path of this node.
   std::string GetPath() const;
-
+  bool HasPath(std::string_view path) const;
+  void ComputePathHash();
   void AddChild(Node* child);
   Node* GetUniqueChildDirectory();
 

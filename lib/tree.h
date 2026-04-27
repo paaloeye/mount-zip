@@ -20,17 +20,14 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
-
-#include <boost/container_hash/hash.hpp>
 
 #include "node.h"
 
 // Holds the ZIP filesystem tree.
 class Tree {
  public:
-  ~Tree();
-
   // Extraction options.
   struct Options {
     // Filename encoding in ZIP.
@@ -74,13 +71,17 @@ class Tree {
   // For tests.
   Tree(const std::string& path) : Tree(std::span(&path, 1), Options{}) {}
 
-  // Finds an existing node with the given |path|.
-  // Returns a null pointer if no matching node can be found.
-  Node* Find(std::string_view path);
+  // Finds a node in the tree using a pre-computed path hash.
+  Node* FindNode(const HashedStringView& path);
+
+  // Finds a node in the tree by its full absolute path.
+  Node* FindNode(std::string_view path) {
+    return FindNode(HashedStringView(Path(path).WithoutTrailingSeparator()));
+  }
 
   static const blksize_t block_size = Node::block_size;
   blkcnt_t GetBlockCount() const { return total_block_count_; }
-  fsfilcnt_t GetNodeCount() const { return files_by_path_.size(); }
+  fsfilcnt_t GetNodeCount() const { return nodes_by_path_.size(); }
 
  private:
   struct CloseZip {
@@ -109,9 +110,9 @@ class Tree {
                                      i64 id,
                                      std::string_view original_path);
 
-  // Finds an existing dir node with the given |path|, or create one (and all
-  // the needed intermediary nodes).
-  Node* CreateDir(std::string_view path);
+  // Returns a directory node for the given path, creating it and its parents if
+  // missing.
+  Node* GetOrCreateDirNode(std::string_view path);
 
   // String conversion function.
   using ToUtf8 = std::function<std::string_view(std::string_view)>;
@@ -128,7 +129,7 @@ class Tree {
 
   // Attaches the given |node|, renaming it if necessary to prevent name
   // collisions.
-  Node* Attach(Node::Ptr node);
+  Node* RenameIfCollision(Node::Ptr node);
 
   // Reads the password from the standard input.
   // Returns true if a non-empty password was read.
@@ -142,6 +143,8 @@ class Tree {
   void Deindex(Node& node);
   void Reindex(Node& node);
 
+  void RehashIfNecessary();
+
   // Computes the optimal number of buckets for the hash tables indexing the
   // given ZIP archives.
   static size_t GetBucketCount(const Zips& zips);
@@ -152,61 +155,54 @@ class Tree {
   // Extraction options.
   const Options opts_;
 
-  // Path extractor for Node.
-  struct GetPath {
-    using type = std::string;
-    std::string operator()(const Node& node) const { return node.GetPath(); }
+  // Hash extractor for Node.
+  struct GetHash {
+    size_t operator()(const HashedStringView& hsv) const { return hsv.hash; }
+    size_t operator()(const Node& node) const { return node.path_hash; }
   };
 
-  using OriginalPath = std::pair<const zip_t*, std::string_view>;
+  struct HasSamePath {
+    bool operator()(const Node& a, const Node& b) const {
+      return a.path_hash == b.path_hash && a.parent == b.parent &&
+             a.name == b.name;
+    }
 
-  // Original path extractor for Node.
-  struct GetOriginalPath {
-    using type = OriginalPath;
-    OriginalPath operator()(const Node& node) const {
-      return {node.zip, node.original_path};
+    bool operator()(const HashedStringView& hsv, const Node& n) const {
+      return hsv.hash == n.path_hash && n.HasPath(hsv.string);
     }
   };
 
-  using FilesByPath =
+  using NodesByPathBase =
       bi::unordered_set<Node,
                         bi::member_hook<Node, Node::ByPath, &Node::by_path>,
                         bi::constant_time_size<true>,
                         bi::power_2_buckets<true>,
-                        bi::compare_hash<true>,
-                        bi::key_of_value<GetPath>,
-                        bi::equal<std::equal_to<std::string_view>>,
-                        bi::hash<boost::hash<std::string_view>>>;
+                        bi::compare_hash<false>,
+                        bi::hash<GetHash>,
+                        bi::equal<HasSamePath>>;
 
-  using FilesByOriginalPath = bi::unordered_set<
-      Node,
-      bi::member_hook<Node, Node::ByPath, &Node::by_original_path>,
-      bi::constant_time_size<false>,
-      bi::power_2_buckets<true>,
-      bi::compare_hash<true>,
-      bi::key_of_value<GetOriginalPath>,
-      bi::hash<boost::hash<OriginalPath>>>;
+  struct NodesByPath : NodesByPathBase {
+    using NodesByPathBase::NodesByPathBase;
+    ~NodesByPath();
+  };
 
-  const size_t bucket_count_ = GetBucketCount(zips_);
-
-  using BucketByPath = FilesByPath::bucket_type;
-  const std::unique_ptr<BucketByPath[]> buckets_by_path_{
-      new BucketByPath[bucket_count_]};
-
-  using BucketByOriginalPath = FilesByOriginalPath::bucket_type;
-  const std::unique_ptr<BucketByOriginalPath[]> buckets_by_original_path_{
-      new BucketByOriginalPath[bucket_count_]};
+  // Hash table buckets.
+  std::vector<NodesByPath::bucket_type> buckets_by_path_{1 << 4};
 
   // Collection of all Nodes indexed by full path.
   // Owns the nodes it references.
-  FilesByPath files_by_path_{{buckets_by_path_.get(), bucket_count_}};
+  NodesByPath nodes_by_path_{
+      {buckets_by_path_.data(), buckets_by_path_.size()}};
 
-  // Collection of Nodes indexed by original path.
-  FilesByOriginalPath files_by_original_path_{
-      {buckets_by_original_path_.get(), bucket_count_}};
+  std::unordered_map<std::string_view, Node*> files_by_original_path_;
 
   // Root node.
-  Node* const root_ = new Node{.nlink = 2, .mode = S_IFDIR | 0755, .name = "/"};
+  Node* const root_ = [] {
+    Node* const n = new Node{
+        .parent = nullptr, .name = "/", .mode = S_IFDIR | 0755, .nlink = 2};
+    n->ComputePathHash();
+    return n;
+  }();
 
   blkcnt_t total_block_count_ = 1;
 

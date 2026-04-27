@@ -172,7 +172,7 @@ struct Operations : fuse_operations {
   // Finds a node by full path.
   static const Node* FindNode(std::string_view const path) {
     assert(g_tree);
-    return g_tree->Find(path);
+    return g_tree->FindNode(path);
   }
 
   static int GetAttr(const char* const path,
@@ -232,7 +232,7 @@ struct Operations : fuse_operations {
                      off_t,
 #if FUSE_USE_VERSION >= 30
                      fuse_file_info* const fi,
-                     fuse_readdir_flags) try {
+                     enum fuse_readdir_flags const flags) try {
 #else
                      fuse_file_info* const fi) try {
 #endif
@@ -242,12 +242,20 @@ struct Operations : fuse_operations {
     assert(n);
     assert(n->IsDir());
 
-    const auto add = [buf, filler, n](const char* const name,
-                                      const struct stat* const z) {
 #if FUSE_USE_VERSION >= 30
-      if (filler(buf, name, z, 0, FUSE_FILL_DIR_PLUS)) {
+    const bool plus = (flags & FUSE_READDIR_PLUS) != 0;
 #else
-      if (filler(buf, name, z, 0)) {
+    const bool plus = false;
+#endif
+
+    const auto add = [buf, filler, n, plus](const char* const name,
+                                            const struct stat* const st) {
+#if FUSE_USE_VERSION >= 30
+      const enum fuse_fill_dir_flags flags =
+          plus ? FUSE_FILL_DIR_PLUS : static_cast<enum fuse_fill_dir_flags>(0);
+      if (filler(buf, name, st, 0, flags)) {
+#else
+      if (filler(buf, name, st, 0)) {
 #endif
         LOG(ERROR) << "Cannot list items in " << *n
                    << ": Cannot allocate memory";
@@ -256,19 +264,27 @@ struct Operations : fuse_operations {
     };
 
     Timer const timer;
-    struct stat z = *n;
-    add(".", &z);
+    struct stat z;
+
+    if (plus) {
+      z = *n;
+    }
+    add(".", plus ? &z : nullptr);
 
     if (const Node* const parent = n->parent) {
-      z = *parent;
-      add("..", &z);
+      if (plus) {
+        z = *parent;
+      }
+      add("..", plus ? &z : nullptr);
     } else {
       add("..", nullptr);
     }
 
     for (const Node& child : n->children) {
-      z = child;
-      add(child.name.c_str(), &z);
+      if (plus) {
+        z = child;
+      }
+      add(child.name.c_str(), plus ? &z : nullptr);
     }
 
     LOG(DEBUG) << "List " << *n << " -> " << n->children.size() << " items in "
