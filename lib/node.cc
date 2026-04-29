@@ -296,19 +296,23 @@ void Node::AddChild(Node* const child) {
 
 Node* Node::GetUniqueChildDirectory() {
   if (!IsDir()) {
+    // LOG(DEBUG) << *this << " is not a dir";
     return nullptr;
   }
 
   Node::Children::iterator const it = children.begin();
   if (it == children.end()) {
+    // LOG(DEBUG) << *this << " has no children";
     return nullptr;
   }
 
   if (std::next(it) != children.end()) {
+    // LOG(DEBUG) << *this << " has more than one child";
     return nullptr;
   }
 
   if (!it->IsDir()) {
+    // LOG(DEBUG) << *it << " is not a dir";
     return nullptr;
   }
 

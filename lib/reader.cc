@@ -285,7 +285,8 @@ class CacheFileReader : public UnbufferedReader {
     while (pos_ < offset) {
       if (should_log_progress) {
         LOG(DEBUG) << "Caching " << total_to_cache << " bytes... "
-                   << 100 * (pos_ - start_pos) / total_to_cache << "%";
+                   << ProgressMessage(100 * (pos_ - start_pos) /
+                                      total_to_cache);
       }
 
       const ssize_t buf_size = 64 * 1024;
@@ -404,7 +405,7 @@ void BufferedReader::Advance(off_t jump) {
   do {
     if (should_log_progress) {
       LOG(DEBUG) << "Skipping " << total_to_cache << " bytes... "
-                 << 100 * (pos_ - start_pos) / total_to_cache << "%";
+                 << ProgressMessage(100 * (pos_ - start_pos) / total_to_cache);
     }
 
     ssize_t count = buffer_size_ - buffer_start_;

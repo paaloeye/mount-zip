@@ -496,11 +496,12 @@ Tree::Tree(std::span<const std::string> paths, Options opts)
     assert(chunk_size >= 0);
     total_extracted_size += chunk_size;
     if (should_display_progress) {
-      LOG(INFO) << "Loading "
-                << (total_extracted_size < total_uncompressed_size
-                        ? 100 * total_extracted_size / total_uncompressed_size
-                        : 100)
-                << "%";
+      LOG(INFO) << "Loading... "
+                << ProgressMessage(total_extracted_size <
+                                           total_uncompressed_size
+                                       ? 100 * total_extracted_size /
+                                             total_uncompressed_size
+                                       : 100);
     }
   };
 
@@ -651,7 +652,7 @@ Tree::Tree(std::span<const std::string> paths, Options opts)
   }
 
   if (should_display_progress.Count()) {
-    LOG(INFO) << "Loaded 100%";
+    LOG(INFO) << "Loading... " << ProgressMessage(100);
   }
 
   // Trim the top level if necessary.

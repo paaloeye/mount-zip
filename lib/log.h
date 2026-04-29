@@ -44,10 +44,13 @@ enum class LogLevel {
 };
 
 extern LogLevel g_log_level;
+extern bool g_latest_log_is_ephemeral;
 
 void SetLogLevel(LogLevel level);
 
 #define LOG_IS_ON(level) (LogLevel::level <= g_log_level)
+
+enum class ProgressMessage : int;
 
 // Accumulates a log message and logs it.
 class Logger {
@@ -64,10 +67,17 @@ class Logger {
     return std::move(*this);
   }
 
+  Logger&& operator<<(ProgressMessage const a) && {
+    oss_ << static_cast<int>(a) << "%";
+    ephemeral_ = true;
+    return std::move(*this);
+  }
+
  private:
   const LogLevel level_;
   const int err_;
   std::ostringstream oss_;
+  bool ephemeral_ = false;
 };
 
 #define LOG(level)                    \

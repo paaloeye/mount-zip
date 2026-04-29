@@ -15,9 +15,13 @@
 
 #include "log.h"
 
+#include <unistd.h>
+
 #include <cstring>
 
 LogLevel g_log_level = LogLevel::INFO;
+
+bool g_latest_log_is_ephemeral = false;
 
 void SetLogLevel(LogLevel const level) {
   g_log_level = level;
@@ -32,5 +36,11 @@ Logger::~Logger() {
     oss_ << ": " << strerror(err_);
   }
 
+  if (g_latest_log_is_ephemeral && isatty(STDERR_FILENO)) {
+    std::string_view const s = "\033[F\033[K";
+    std::ignore = write(STDERR_FILENO, s.data(), s.size());
+  }
+
   syslog(static_cast<int>(level_), "%s", std::move(oss_).str().c_str());
+  g_latest_log_is_ephemeral = ephemeral_;
 }
