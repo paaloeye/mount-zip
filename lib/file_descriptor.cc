@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-#include "scoped_file.h"
+#include "file_descriptor.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -26,7 +26,7 @@
 #include "log.h"
 #include "path.h"
 
-ScopedFile::~ScopedFile() {
+FileDescriptor::~FileDescriptor() {
   if (IsValid() && close(fd_) < 0) {
     PLOG(ERROR) << "Cannot close file";
   }
@@ -43,7 +43,7 @@ FileMapping::~FileMapping() {
 // Throws a system_error in case of error.
 FileMapping::FileMapping(const char* const path) {
   // Open file in read-only mode.
-  const ScopedFile file(open(path, O_RDONLY));
+  const FileDescriptor file(open(path, O_RDONLY));
   if (!file.IsValid()) {
     ThrowSystemError("Cannot open file ", Path(path));
   }

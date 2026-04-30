@@ -13,23 +13,24 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-#ifndef SCOPED_FILE_H
-#define SCOPED_FILE_H
+#ifndef FILE_DESCRIPTOR_H
+#define FILE_DESCRIPTOR_H
 
 #include <utility>
 
 #include <sys/types.h>
 
 // A scoped file descriptor.
-class ScopedFile {
+class FileDescriptor {
  public:
   // Closes the file descriptor if it is valid.
-  ~ScopedFile();
+  ~FileDescriptor();
 
-  explicit ScopedFile(int fd) noexcept : fd_(fd) {}
-  ScopedFile(ScopedFile&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
+  explicit FileDescriptor(int fd) noexcept : fd_(fd) {}
+  FileDescriptor(FileDescriptor&& other) noexcept
+      : fd_(std::exchange(other.fd_, -1)) {}
 
-  ScopedFile& operator=(ScopedFile other) noexcept {
+  FileDescriptor& operator=(FileDescriptor other) noexcept {
     std::swap(fd_, other.fd_);
     return *this;
   }

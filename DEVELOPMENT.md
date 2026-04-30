@@ -36,7 +36,7 @@ The `README.md` file serves as both the user guide and the source for the man pa
 The project aims for full **ASAN compliance**. Always verify changes with `ASAN=1 make check-fast`.
 
 ### Resource Management (RAII)
-- Use RAII guards for resource cleanup (e.g., `ScopedFile`, `Cleanup`).
+- Use RAII guards for resource cleanup (e.g., `FileDescriptor`, `Cleanup`).
 - **Shutdown Performance**: Global teardown of the virtual tree is wrapped in `#ifndef NDEBUG`. It is only performed in debug builds to keep production shutdown nearly instant.
 
 ### Portability

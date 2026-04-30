@@ -17,10 +17,9 @@
 
 #include <algorithm>
 #include <cassert>
+#include <climits>
 #include <iomanip>
 #include <unordered_set>
-
-#include <limits.h>
 
 #include "log.h"
 

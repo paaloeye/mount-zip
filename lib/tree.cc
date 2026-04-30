@@ -43,8 +43,8 @@
 
 #include "error.h"
 #include "extra_field.h"
+#include "file_descriptor.h"
 #include "log.h"
-#include "scoped_file.h"
 
 enum CompressionMethod : int;
 

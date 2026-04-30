@@ -31,8 +31,8 @@
 #include <unistd.h>
 
 #include "error.h"
+#include "file_descriptor.h"
 #include "path.h"
-#include "scoped_file.h"
 
 static std::string GetTmpDir() {
   const char* const val = std::getenv("TMPDIR");
@@ -137,7 +137,7 @@ class CacheFileReader : public UnbufferedReader {
  private:
   // Creates a new and empty cache file.
   // Throws std::system_error in case of error.
-  static ScopedFile CreateCacheFile() {
+  static FileDescriptor CreateCacheFile() {
     switch (cache_strategy_) {
       case CacheStrategy::NoCache:
         throw std::runtime_error(
@@ -148,7 +148,8 @@ class CacheFileReader : public UnbufferedReader {
         {
 #if __APPLE__
           // macOS has no memfd_create()
-          ScopedFile file(shm_open("/cache", O_RDWR | O_CREAT | O_EXCL, 0600));
+          FileDescriptor file(
+              shm_open("/cache", O_RDWR | O_CREAT | O_EXCL, 0600));
           if (!file.IsValid()) {
             ThrowSystemError("Cannot create cache file in memory");
           }
@@ -157,7 +158,7 @@ class CacheFileReader : public UnbufferedReader {
             ThrowSystemError("Cannot unlink cache file in memory");
           }
 #else
-          ScopedFile file(memfd_create("cache", 0));
+          FileDescriptor file(memfd_create("cache", 0));
           if (!file.IsValid()) {
             ThrowSystemError("Cannot create cache file in memory");
           }
@@ -170,7 +171,7 @@ class CacheFileReader : public UnbufferedReader {
       case CacheStrategy::InFile:
 #ifdef O_TMPFILE
         // Create a cache file in the cache dir.
-        if (ScopedFile file(
+        if (FileDescriptor file(
                 open(cache_dir_.c_str(), O_TMPFILE | O_RDWR | O_EXCL, 0));
             file.IsValid()) {
           LOG(DEBUG) << "Created anonymous cache file in " << Path(cache_dir_);
@@ -194,7 +195,7 @@ class CacheFileReader : public UnbufferedReader {
 
         std::string path = cache_dir_;
         Path::Append(&path, "XXXXXX");
-        ScopedFile file(mkstemp(path.data()));
+        FileDescriptor file(mkstemp(path.data()));
 
         if (!file.IsValid()) {
           ThrowSystemError("Cannot create named cache file in ",
@@ -215,7 +216,7 @@ class CacheFileReader : public UnbufferedReader {
   // Creates this cache file if necessary.
   // Throws std::system_error in case of error.
   static int GetCacheFile() {
-    static const ScopedFile file = CreateCacheFile();
+    static const FileDescriptor file = CreateCacheFile();
     return file.GetDescriptor();
   }
 
