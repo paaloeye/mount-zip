@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <zip.h>
 
+#include <boost/container_hash/hash.hpp>
 #include <boost/intrusive/slist.hpp>
 #include <boost/intrusive/unordered_set.hpp>
 

@@ -20,7 +20,9 @@
 #include <gtest/gtest.h>
 
 #include <sys/stat.h>
+#ifndef __APPLE__
 #include <sys/sysmacros.h>
+#endif
 #include <cstdint>
 
 namespace {

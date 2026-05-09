@@ -18,6 +18,7 @@
 import hashlib
 import logging
 import os
+import platform
 import pprint
 import random
 import stat
@@ -25,6 +26,9 @@ import subprocess
 import sys
 import tempfile
 import time
+
+# macOS umount lacks -l (lazy); use -f (force) instead.
+_UMOUNT_FLAG = '-f' if platform.system() == 'Darwin' else '-l'
 
 sys.setrecursionlimit(3000)
 
@@ -153,7 +157,7 @@ def MountZipAndGetTree(zip_names, options=[], password='', use_md5=True):
       return GetTree(mount_point, use_md5=use_md5), os.statvfs(mount_point)
     finally:
       logging.debug(f'Unmounting {zip_paths!r} from {mount_point!r}...')
-      subprocess.run(['umount', '-l', mount_point], check=True)
+      subprocess.run(['umount', _UMOUNT_FLAG, mount_point], check=True)
       logging.debug(f'Unmounted {zip_paths!r} from {mount_point!r}')
 
 
@@ -1909,7 +1913,7 @@ def TestBigZip(options=[]):
         os.close(fd)
     finally:
       logging.debug(f'Unmounting {zip_path!r} from {mount_point!r}...')
-      subprocess.run(['umount', '-l', mount_point], check=True)
+      subprocess.run(['umount', _UMOUNT_FLAG, mount_point], check=True)
       logging.debug(f'Unmounted {zip_path!r} from {mount_point!r}')
 
 
@@ -1950,7 +1954,7 @@ def TestManyNodes():
 
     finally:
       logging.debug(f'Unmounting {zip_path!r} from {mount_point!r}...')
-      subprocess.run(['umount', '-l', mount_point], check=True)
+      subprocess.run(['umount', _UMOUNT_FLAG, mount_point], check=True)
       logging.debug(f'Unmounted {zip_path!r} from {mount_point!r}')
 
 
@@ -1994,7 +1998,7 @@ def TestBigZipNoCache(options=['-o', 'nocache']):
         os.close(fd)
     finally:
       logging.debug(f'Unmounting {zip_path!r} from {mount_point!r}...')
-      subprocess.run(['umount', '-l', mount_point], check=True)
+      subprocess.run(['umount', _UMOUNT_FLAG, mount_point], check=True)
       logging.debug(f'Unmounted {zip_path!r} from {mount_point!r}')
 
 

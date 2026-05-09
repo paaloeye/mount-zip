@@ -40,6 +40,23 @@ PROJECT_CXXFLAGS += -DFUSE_USE_VERSION=26
 endif
 
 DEPS += libzip icu-uc icu-i18n
+
+# On macOS, icu4c is keg-only (Homebrew does not symlink it into the default
+# search path because macOS ships its own libicucore). Override PKG_CONFIG to
+# carry the pinned icu4c path inline so every pkg-config call in this make and
+# all sub-makes resolves the correct version regardless of what the shell
+# environment (e.g. pkgx) may have injected.
+
+ifeq ($(shell uname -s),Darwin)
+  BREW_PREFIX := $(shell brew --prefix 2>/dev/null)
+  ifneq ($(BREW_PREFIX),)
+    PKG_CONFIG = env PKG_CONFIG_PATH="$(BREW_PREFIX)/opt/icu4c/lib/pkgconfig" pkg-config
+    CPPFLAGS += -I$(BREW_PREFIX)/opt/boost/include
+    export PKG_CONFIG
+    export CPPFLAGS
+  endif
+endif
+
 PROJECT_CXXFLAGS += $(shell $(PKG_CONFIG) --cflags $(DEPS))
 PROJECT_LDFLAGS = -L$(OUT) -lmountzip $(shell $(PKG_CONFIG) --libs $(DEPS))
 
