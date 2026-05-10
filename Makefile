@@ -61,6 +61,11 @@ COMMON_CXXFLAGS += -fsanitize=undefined
 PKG_LDFLAGS += -fsanitize=undefined
 endif
 
+ifeq ($(COVERAGE), 1)
+COMMON_CXXFLAGS += -fprofile-arcs -ftest-coverage
+LDFLAGS += --coverage
+endif
+
 PREFIX ?= /usr/local
 BINDIR = $(PREFIX)/bin
 MANDIR = $(PREFIX)/share/man/man1
@@ -148,7 +153,17 @@ check-fast: $(OUT)/$(PROJECT) $(UNIT_TEST_BIN)
 
 valgrind: $(OUT)/$(PROJECT) $(UNIT_TEST_BIN)
 	$(if $(UNIT_TEST_BIN),valgrind -q --leak-check=full --track-origins=yes --error-exitcode=33 $(UNIT_TEST_BIN))
-	MOUNT_WRAPPER="valgrind -q --leak-check=full --track-origins=yes --error-exitcode=33" python3 tests/test.py --fast
+	MOUNT_WRAPPER="valgrind -q --leak-check=full --error-exitcode=33" python3 tests/test.py --fast
+
+TEST_TARGET ?= check-fast
+
+coverage:
+	$(MAKE) clean
+	$(MAKE) DEBUG=1 COVERAGE=1 $(TEST_TARGET)
+	lcov --capture --directory $(OUT) --output-file $(OUT)/coverage.info --ignore-errors mismatch,inconsistent
+	lcov --remove $(OUT)/coverage.info '/usr/include/*' '/usr/lib/*' 'tests/*' --output-file $(OUT)/coverage.info --ignore-errors unused,inconsistent
+	genhtml $(OUT)/coverage.info --output-directory $(OUT)/coverage --ignore-errors inconsistent
+	@echo "Coverage report generated at $(OUT)/coverage/index.html"
 
 test: check
 
