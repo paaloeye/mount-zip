@@ -119,12 +119,14 @@ $(MAN): README.md
 	    -e 's/^\.TP/.PD\n.TP/g' > $@
 
 install: $(DEST)
-	$(INSTALL) -D "$(DEST)" "$(DESTDIR)$(BINDIR)/mount-zip"
-	$(INSTALL) -D -m 644 $(MAN) "$(DESTDIR)$(MANDIR)/$(MAN)"
+	mkdir -p "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(MANDIR)"
+	$(INSTALL) "$(DEST)" "$(DESTDIR)$(BINDIR)/mount-zip"
+	$(INSTALL) -m 644 $(MAN) "$(DESTDIR)$(MANDIR)/$(MAN)"
 
 install-strip: $(DEST)
-	$(INSTALL) -D -s "$(DEST)" "$(DESTDIR)$(BINDIR)/mount-zip"
-	$(INSTALL) -D -m 644 $(MAN) "$(DESTDIR)$(MANDIR)/$(MAN)"
+	mkdir -p "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(MANDIR)"
+	$(INSTALL) -s "$(DEST)" "$(DESTDIR)$(BINDIR)/mount-zip"
+	$(INSTALL) -m 644 $(MAN) "$(DESTDIR)$(MANDIR)/$(MAN)"
 
 uninstall:
 	rm -f "$(DESTDIR)$(BINDIR)/mount-zip" "$(DESTDIR)$(MANDIR)/$(MAN)"
