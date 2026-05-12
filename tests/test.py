@@ -15,6 +15,8 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import argparse
+import errno
 import hashlib
 import logging
 import os
@@ -25,65 +27,116 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
+from contextlib import contextmanager
 
 sys.setrecursionlimit(3000)
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--fast', action='store_true', help='skip slow tests')
+parser.add_argument('-v',
+                    '--verbose',
+                    action='store_true',
+                    help='enable debug logging')
+args = parser.parse_args()
+
+logging.getLogger().setLevel('DEBUG' if args.verbose else 'INFO')
+is_fast = args.fast
+
+on_mac = sys.platform.startswith('darwin')
+on_linux = sys.platform.startswith('linux')
+
+has_memcache = not on_mac
+if not has_memcache:
+    logging.info('Will skip tests relying on memcache')
+
+has_xattrs = not on_mac
+if not has_memcache:
+    logging.info('Will skip tests for xattrs')
+
 
 # Computes the MD5 hash of the given file.
 # Returns the MD5 hash as an hexadecimal string.
 # Throws OSError if the file cannot be read.
 def md5(path):
-  h = hashlib.md5()
-  with open(path, 'rb') as f:
-    while chunk := f.read(4096):
-      h.update(chunk)
-  return h.hexdigest()
+    h = hashlib.md5()
+    with open(path, 'rb') as f:
+        while chunk := f.read(4096):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 # Walks the given directory.
 # Returns a dict representing all the files and directories.
 def GetTree(root, use_md5=True):
-  result = {}
+    result = {}
 
-  def scan(path, st):
-    mode = st.st_mode
-    line = {
-        'ino': st.st_ino,
-        'mode': stat.filemode(mode),
-        'nlink': st.st_nlink,
-        'uid': st.st_uid,
-        'gid': st.st_gid,
-        'atime': st.st_atime_ns,
-        'mtime': st.st_mtime_ns,
-        'ctime': st.st_ctime_ns,
-    }
-    result[os.path.relpath(path, root)] = line
-    if stat.S_ISREG(mode):
-      line['size'] = st.st_size
-      try:
-        if use_md5:
-          line['md5'] = md5(path)
-      except OSError as e:
-        line['errno'] = e.errno
-    elif stat.S_ISLNK(mode):
-      line['target'] = os.readlink(path)
-    elif stat.S_ISBLK(mode) or stat.S_ISCHR(mode):
-      line['rdev'] = st.st_rdev
-    elif stat.S_ISDIR(mode):
-      try:
-        for entry in list(os.scandir(path)):
-          scan(entry.path, entry.stat(follow_symlinks=False))
-      except OSError as e:
-        line['errno'] = e.errno
+    def scan(path, st):
+        mode = st.st_mode
+        line = {
+            'ino': st.st_ino,
+            'mode': stat.filemode(mode),
+            'nlink': st.st_nlink,
+            'uid': st.st_uid,
+            'gid': st.st_gid,
+            'atime': st.st_atime_ns,
+            'mtime': st.st_mtime_ns,
+            'ctime': st.st_ctime_ns,
+        }
 
-  st = os.stat(root, follow_symlinks=False)
+        key = os.path.relpath(path, root)
 
-  # On some systems, the mount point is not immediately functional.
-  while st.st_ino == 0:
-    time.sleep(0.1)
+        if on_mac:
+            # macOS VFS returns NFD-normalised filenames; normalise to NFC so
+            # tree keys match the NFC names stored in archives.
+            key = unicodedata.normalize('NFC', key)
+
+        result[key] = line
+
+        if stat.S_ISREG(mode):
+            line['size'] = st.st_size
+            line['blocks'] = st.st_blocks
+            try:
+                if use_md5:
+                    line['md5'] = md5(path)
+            except OSError as e:
+                line['errno'] = e.errno
+        elif stat.S_ISLNK(mode):
+            line['target'] = os.readlink(path)
+        elif stat.S_ISBLK(mode) or stat.S_ISCHR(mode):
+            line['rdev'] = st.st_rdev
+        elif stat.S_ISDIR(mode):
+            try:
+                for entry in list(os.scandir(path)):
+                    scan(entry.path, entry.stat(follow_symlinks=False))
+            except OSError as e:
+                line['errno'] = e.errno
+
+        if has_xattrs:
+            try:
+                attrs = os.listxattr(path, follow_symlinks=False)
+                xattr_dict = dict()
+                for attr in attrs:
+                    try:
+                        value = os.getxattr(path, attr, follow_symlinks=False)
+                        xattr_dict[attr] = value.decode('utf-8')
+                    except OSError as e:
+                        xattr_dict[attr] = f'<error: {e.errno}>'
+                if xattr_dict:
+                    logging.debug(f"Path {path} has xattrs: {xattr_dict}")
+                line['xattr'] = xattr_dict
+            except OSError as e:
+                line['xattr'] = e.errno
+
     st = os.stat(root, follow_symlinks=False)
 
-  scan(root, st)
-  return result
+    # On some systems, the mount point is not immediately functional.
+    while st.st_ino == 0:
+        time.sleep(0.1)
+        st = os.stat(root, follow_symlinks=False)
+
+    scan(root, st)
+    return result
 
 
 # Total number of errors.
@@ -92,75 +145,119 @@ error_count = 0
 
 # Logs the given error.
 def LogError(msg):
-  logging.error(msg)
-  global error_count
-  error_count += 1
+    logging.error(msg)
+    global error_count
+    error_count += 1
 
 
 # Compares got_tree with want_tree. If strict is True, checks that got_tree
 # doesn't contain any extra entries that aren't in want_tree.
 def CheckTree(got_tree, want_tree, strict=False):
-  for name, want_entry in want_tree.items():
-    try:
-      got_entry = got_tree.pop(name)
-      for key, want_value in want_entry.items():
-        got_value = got_entry.get(key)
-        if got_value != want_value:
-          LogError(
-              f'Mismatch for {name!r}[{key}] got: {got_value!r}, want:'
-              f' {want_value!r}'
-          )
-    except KeyError:
-      LogError(f'Missing entry {name!r}')
+    for name, want_entry in want_tree.items():
+        try:
+            got_entry = got_tree.pop(name)
+            for key, want_value in want_entry.items():
+                if not has_xattrs and key == 'xattr':
+                    continue
 
-  if strict and got_tree:
-    LogError(f'Found {len(got_tree)} unexpected entries: {got_tree}')
+                if on_mac and key == 'rdev':
+                    # macFUSE re-encodes device numbers using BSD packing, so
+                    # raw rdev values differ from Linux. Skip on macOS.
+                    continue
+
+                got_value = got_entry.get(key)
+
+                if key in ('atime', 'mtime',
+                           'ctime') and want_value % 1000000000 == 0:
+                    got_value //= 1000000000
+                    want_value //= 1000000000
+
+                if got_value != want_value:
+                    LogError(
+                        f'Mismatch for {name!r}[{key}] got: {got_value!r}, want:'
+                        f' {want_value!r}')
+        except KeyError:
+            LogError(f'Missing entry {name!r}')
+
+    if strict and got_tree:
+        LogError(f'Found {len(got_tree)} unexpected entries: {got_tree}')
 
 
 # Directory of this test program.
 script_dir = os.path.dirname(os.path.realpath(__file__))
 
-# Directory containing the ZIP archives to mount.
+# Directory containing the archives to mount.
 data_dir = os.path.join(script_dir, 'data')
 
 # Path of the FUSE mounter.
 mount_program = os.path.join(script_dir, '..', 'out', 'mount-zip')
 
+env = os.environ.copy()
+if not is_fast:
+    env['MALLOC_PERTURB_'] = '170'
 
-# Mounts the given ZIP archives, walks the mounted ZIP(s) and unmounts.
+
+def Unmount(mount_point):
+    # Linux: -l (lazy) detaches immediately even if mount is busy.
+    # macOS: -l is unsupported; -f (force) is the closest equivalent.
+    if on_mac:
+        subprocess.run(['umount', '-f', mount_point], check=True)
+    else:
+        subprocess.run(['umount', '-l', mount_point], check=True)
+
+
+@contextmanager
+def MountArchive(zip_names, options=[], password='', env=env):
+    with tempfile.TemporaryDirectory() as mount_point:
+        if type(zip_names) is not list: zip_names = [zip_names]
+        zip_paths = [
+            os.path.join(script_dir, 'data', zip_name)
+            for zip_name in zip_names
+        ]
+        logging.debug(f'Mounting {zip_paths!r} on {mount_point!r}...')
+        command = [mount_program, *options]
+        if args.verbose: command.append('-v')
+        command.extend([*zip_paths, mount_point])
+        logging.debug(f'Command: {command}')
+        if 'MOUNT_WRAPPER' in env:
+            command = env['MOUNT_WRAPPER'].split() + command
+        subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            input=password,
+            encoding='UTF-8',
+            env=env,
+        )
+        try:
+            logging.debug(f'Mounted archive {zip_paths!r} on {mount_point!r}')
+            yield mount_point
+        finally:
+            logging.debug(f'Unmounting {zip_paths!r} from {mount_point!r}...')
+            Unmount(mount_point)
+            logging.debug(f'Unmounted {zip_paths!r} from {mount_point!r}')
+
+
+# Mounts the given archive(s), walks the mounted archive and unmounts.
 # Returns a pair where:
-# - member 0 is a dict representing the mounted ZIP(s).
+# - member 0 is a dict representing the mounted archive.
 # - member 1 is the result of os.statvfs
 #
-# Throws subprocess.CalledProcessError if the ZIP(s) cannot be mounted.
-def MountZipAndGetTree(zip_names, options=[], password='', use_md5=True):
-  with tempfile.TemporaryDirectory() as mount_point:
-    if type(zip_names) is not list:
-      zip_names = [zip_names]
-    zip_paths = [
-        os.path.join(script_dir, 'data', zip_name) for zip_name in zip_names
-    ]
-    logging.debug(f'Mounting {zip_paths!r} on {mount_point!r}...')
-    subprocess.run(
-        [mount_program, *options, '--', *zip_paths, mount_point],
-        check=True,
-        capture_output=True,
-        input=password,
-        encoding='UTF-8',
-    )
-    try:
-      logging.debug(f'Mounted ZIP {zip_paths!r} on {mount_point!r}')
-      return GetTree(mount_point, use_md5=use_md5), os.statvfs(mount_point)
-    finally:
-      logging.debug(f'Unmounting {zip_paths!r} from {mount_point!r}...')
-      subprocess.run(['umount', '-l', mount_point], check=True)
-      logging.debug(f'Unmounted {zip_paths!r} from {mount_point!r}')
+# Throws subprocess.CalledProcessError if the archive cannot be mounted.
+def MountArchiveAndGetTree(zip_names,
+                           options=[],
+                           password='',
+                           use_md5=True,
+                           get_tree=True):
+    with MountArchive(zip_names, options, password) as mount_point:
+        tree = GetTree(mount_point, use_md5=use_md5) if get_tree else None
+        return tree, os.statvfs(mount_point)
 
 
-# Mounts the given ZIP archive, checks the mounted ZIP tree and unmounts.
-# Logs an error if the ZIP cannot be mounted.
-def MountZipAndCheckTree(
-    zip_name,
+# Mounts the given archive(s), checks the mounted archive tree and unmounts.
+# Logs an error if the archive cannot be mounted.
+def MountArchiveAndCheckTree(
+    zip_names,
     want_tree,
     want_blocks=None,
     want_inodes=None,
@@ -169,467 +266,557 @@ def MountZipAndCheckTree(
     strict=True,
     use_md5=True,
 ):
-  s = f'Test {zip_name!r}'
-  if options:
-    s += f', options = {" ".join(options)!r}'
-  if password:
-    s += f', password = {password!r}'
-  logging.info(s)
-  try:
-    got_tree, st = MountZipAndGetTree(
-        zip_name, options=options, password=password, use_md5=use_md5
-    )
+    s = f'Test {zip_names!r}'
+    if options: s += f', options = {" ".join(options)!r}'
+    if password: s += f', password = {password!r}'
+    logging.info(s)
+    try:
+        got_tree, st = MountArchiveAndGetTree(zip_names,
+                                              options=options,
+                                              password=password,
+                                              use_md5=use_md5,
+                                              get_tree=want_tree is not None)
 
-    want_block_size = 512
-    if st.f_bsize < want_block_size:
-      LogError(
-          'Mismatch for st.f_bsize: '
-          f'got: {st.f_bsize}, want at least: {want_block_size}'
-      )
-    if st.f_frsize != want_block_size:
-      LogError(
-          'Mismatch for st.f_frsize: '
-          f'got: {st.f_frsize}, want: {want_block_size}'
-      )
+        want_block_size = 512
+        if st.f_bsize < want_block_size:
+            LogError('Mismatch for st.f_bsize: '
+                     f'got: {st.f_bsize}, want at least: {want_block_size}')
+        if st.f_frsize != want_block_size:
+            LogError('Mismatch for st.f_frsize: '
+                     f'got: {st.f_frsize}, want: {want_block_size}')
 
-    want_name_max = 255
-    if st.f_namemax != want_name_max:
-      LogError(
-          'Mismatch for st.f_namemax: '
-          f'got: {st.f_namemax}, want: {want_name_max}'
-      )
+        want_name_max = 255
+        if st.f_namemax != want_name_max:
+            LogError('Mismatch for st.f_namemax: '
+                     f'got: {st.f_namemax}, want: {want_name_max}')
 
-    if want_blocks is not None and st.f_blocks != want_blocks:
-      LogError(
-          f'Mismatch for st.f_blocks: got: {st.f_blocks}, want: {want_blocks}'
-      )
+        if want_blocks is not None and st.f_blocks != want_blocks:
+            LogError(
+                f'Mismatch for st.f_blocks: got: {st.f_blocks}, want: {want_blocks}'
+            )
 
-    if want_inodes is not None and st.f_files != want_inodes:
-      LogError(
-          f'Mismatch for st.f_files: got: {st.f_files}, want: {want_inodes}'
-      )
+        if want_inodes is not None and st.f_files != want_inodes:
+            LogError(
+                f'Mismatch for st.f_files: got: {st.f_files}, want: {want_inodes}'
+            )
 
-    CheckTree(got_tree, want_tree, strict=strict)
-  except subprocess.CalledProcessError as e:
-    LogError(f'Cannot test {zip_name}: {e.stderr}')
+        if want_tree is not None: CheckTree(got_tree, want_tree, strict=strict)
+    except subprocess.CalledProcessError as e:
+        LogError(f'Cannot test {zip_names!r}: {e.stderr}')
 
 
-# Try to mount the given ZIP archive, and expects an error.
-# Logs an error if the ZIP can be mounted, or if the returned error code doesn't match.
-def CheckZipMountingError(zip_name, want_error_code, options=[], password=''):
-  s = f'Test {zip_name!r}'
-  if options:
-    s += f', options = {" ".join(options)!r}'
-  if password:
-    s += f', password = {password!r}'
-  logging.info(s)
-  try:
-    got_tree, _ = MountZipAndGetTree(
-        zip_name, options=options, password=password
-    )
-    LogError(f'Want error, Got tree: {got_tree}')
-  except subprocess.CalledProcessError as e:
-    if e.returncode != want_error_code:
-      LogError(
-          f'Want error: {want_error_code}, Got error: {e.returncode} in {e}'
-      )
+# Try to mount the given archive(s), and expects an error.
+# Logs an error if the archive can be mounted, or if the returned error code doesn't match.
+def CheckArchiveMountingError(zip_names,
+                              want_error_code,
+                              options=[],
+                              password=''):
+    s = f'Test {zip_names!r}'
+    if options: s += f', options = {" ".join(options)!r}'
+    if password: s += f', password = {password!r}'
+    logging.info(s)
+    try:
+        got_tree, _ = MountArchiveAndGetTree(zip_names,
+                                             options=options,
+                                             password=password)
+        LogError(f'Want error, Got tree: {got_tree}')
+    except subprocess.CalledProcessError as e:
+        if e.returncode != want_error_code:
+            LogError(
+                f'Want error: {want_error_code}, Got error: {e.returncode} in {e}'
+            )
 
 
 def GenerateReferenceData():
-  for zip_name in os.listdir(os.path.join(script_dir, 'data')):
-    tree, _ = MountZipAndGetTree(zip_name, password='password')
-    all_zips[zip_name] = tree
+    for zip_name in os.listdir(os.path.join(script_dir, 'data')):
+        tree, _ = MountArchiveAndGetTree(zip_name, password='password')
+        all_zips[zip_name] = tree
 
-  pprint.pprint(all_zips, compact=True, sort_dicts=False)
+    pprint.pprint(all_zips, compact=True, sort_dicts=False)
 
 
 # Tests most of the ZIP files in data_dir using default mounting options.
-def TestZipWithDefaultOptions():
-  want_trees = {
-      'absolute-path.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          'rootname.ext': {
-              'nlink': 1,
-              'size': 22,
-              'md5': '8b4cc90d421780e7674e2a25db33b770',
-          },
-      },
-      'bad-archive.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          'bash.txt': {
-              'nlink': 1,
-              'mtime': 1265257351000000000,
-              'size': 282292,
-              'errno': 5,
-          },
-      },
-      'bad-crc.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          'bash.txt': {
-              'nlink': 1,
-              'mtime': 1265257351000000000,
-              'size': 282292,
-              'errno': 5,
-          },
-      },
-      'bzip2.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          'bzip2.txt': {
-              'nlink': 1,
-              'size': 36,
-              'md5': 'f28623c0be8da636e6c53ead06ce0731',
-          },
-      },
-      'comment-utf8.zip': {
-          '.': {
-              'nlink': 2,
-              'mtime': 1563727169000000000,
-          },
-          'empty_comment.txt': {
-              'nlink': 1,
-              'mtime': 1563721364000000000,
-              'size': 14,
-              'md5': '3453ff2f4d15a71d21e859829f0da9fc',
-          },
-          'with_comment.txt': {
-              'nlink': 1,
-              'mtime': 1563720300000000000,
-              'size': 13,
-              'md5': '557fcaa19da1b3e2cd6ce8e546a13f46',
-          },
-          'without_comment.txt': {
-              'nlink': 1,
-              'mtime': 1563720306000000000,
-              'size': 16,
-              'md5': '4cdf349a6dc1516f9642ebaf278af394',
-          },
-      },
-      'comment.zip': {
-          '.': {
-              'nlink': 2,
-              'mtime': 1563727169000000000,
-          },
-          'empty_comment.txt': {
-              'nlink': 1,
-              'mtime': 1563721364000000000,
-              'size': 14,
-              'md5': '3453ff2f4d15a71d21e859829f0da9fc',
-          },
-          'with_comment.txt': {
-              'nlink': 1,
-              'mtime': 1563720300000000000,
-              'size': 13,
-              'md5': '557fcaa19da1b3e2cd6ce8e546a13f46',
-          },
-          'without_comment.txt': {
-              'nlink': 1,
-              'mtime': 1563720306000000000,
-              'size': 16,
-              'md5': '4cdf349a6dc1516f9642ebaf278af394',
-          },
-      },
-      'dos-perm.zip': {
-          '.': {'mode': 'drwxr-xr-x', 'nlink': 2},
-          'hidden.txt': {
-              'nlink': 1,
-              'size': 11,
-              'md5': 'fa29ea74a635e3be468256f9007b1bb6',
-          },
-          'normal.txt': {
-              'nlink': 1,
-              'size': 11,
-              'md5': '050256c2ac1d77494b9fddaa933f5eda',
-          },
-          'readonly.txt': {
-              'nlink': 1,
-              'size': 14,
-              'md5': '6f651ad751dadd4e76c8f46b6fae0c48',
-          },
-      },
-      'empty.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-      },
-      'extrafld.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          'README': {
-              'nlink': 1,
-              'mtime': 1372483540000000000,
-              'size': 2551,
-              'md5': '27d03e3bb5ed8add7917810c3ba68836',
-          },
-      },
-      'fifo.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          '-': {
-              'mode': '-rw-r--r--',
-              'nlink': 1,
-              'size': 14,
-              'md5': '42e16527aee5fe43ffa78a89d36a244c',
-          },
-          'fifo': {
-              'mode': '-rw-r--r--',
-              'nlink': 1,
-              'mtime': 1564428868000000000,
-              'size': 13,
-              'md5': 'd36dcce71b10bb7dd348ab6efb1c4aab',
-          },
-      },
-      'file-dir-same-name.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 3},
-          'pet': {'nlink': 3},
-          'pet/cat': {'nlink': 3},
-          'pet/cat/fish': {
-              'nlink': 2,
-          },
-          'pet/cat/fish (1)': {
-              'nlink': 1,
-              'size': 30,
-              'md5': '47661a04dfd111f95ec5b02c4a1dab05',
-          },
-          'pet/cat/fish (2)': {
-              'nlink': 1,
-              'size': 31,
-              'md5': '4969fad4edba3582a114f17000583344',
-          },
-          'pet/cat (1)': {
-              'nlink': 1,
-              'size': 25,
-              'md5': '3a3cd8d02b1a2a232e2684258f38c882',
-          },
-          'pet/cat (2)': {
-              'nlink': 1,
-              'size': 26,
-              'md5': '07691c6ecc5be713b8d1224446f20970',
-          },
-          'pet (1)': {
-              'nlink': 1,
-              'size': 21,
-              'md5': '185743d56c5a917f02e2193a96effb25',
-          },
-          'pet (2)': {
-              'nlink': 1,
-              'size': 22,
-              'md5': 'ec5ffb0de216fb1e9578bc17a169399a',
-          },
-      },
-      'foobar.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          'foo': {
-              'nlink': 1,
-              'mtime': 1565484162000000000,
-              'size': 4,
-              'md5': 'c157a79031e1c40f85931829bc5fc552',
-          },
-      },
-      '--help': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          'foo': {
-              'nlink': 1,
-              'mtime': 1565484162000000000,
-              'size': 4,
-              'md5': 'c157a79031e1c40f85931829bc5fc552',
-          },
-      },
-      'hlink-before-target.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          '0hlink': {
-              'nlink': 2,
-              'size': 10,
-              'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
-          },
-          '1regular': {
-              'nlink': 2,
-              'size': 10,
-              'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
-          },
-      },
-      'hlink-chain.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          '0regular': {
-              'nlink': 3,
-              'size': 10,
-              'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
-          },
-          'hlink1': {
-              'nlink': 3,
-              'size': 10,
-              'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
-          },
-          'hlink2': {
-              'nlink': 3,
-              'size': 10,
-              'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
-          },
-      },
-      'hlink-different-types.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 3},
-          'dir': {
-              'nlink': 2,
-          },
-          'dir/regular': {
-              'nlink': 1,
-              'size': 10,
-              'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
-          },
-          'hlink': {
-              'nlink': 1,
-              'size': 0,
-              'md5': 'd41d8cd98f00b204e9800998ecf8427e',
-          },
-      },
-      'hlink-dir.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 4},
-          'dir': {
-              'nlink': 2,
-          },
-          'dir/regular': {
-              'nlink': 1,
-              'size': 10,
-              'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
-          },
-          'hlink': {
-              'nlink': 2,
-          },
-      },
-      'hlink-recursive-one.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          'hlink': {
-              'nlink': 1,
-              'mtime': 1565807019000000000,
-              'size': 0,
-              'md5': 'd41d8cd98f00b204e9800998ecf8427e',
-          },
-      },
-      'hlink-recursive-two.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          'hlink1': {
-              'nlink': 2,
-              'mtime': 1565807019000000000,
-              'size': 0,
-              'md5': 'd41d8cd98f00b204e9800998ecf8427e',
-          },
-          'hlink2': {
-              'nlink': 2,
-              'mtime': 1565807019000000000,
-              'size': 0,
-              'md5': 'd41d8cd98f00b204e9800998ecf8427e',
-          },
-      },
-      'hlink-relative.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          '0regular': {
-              'nlink': 2,
-              'size': 10,
-              'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
-          },
-          'hlink': {
-              'nlink': 2,
-              'size': 10,
-              'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
-          },
-      },
-      'hlink-special.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          '0block': {
-              'mode': 'brw-r--r--',
-              'nlink': 1,
-              'mtime': 1565807019000000000,
-              'rdev': 2303,
-          },
-          '0fifo': {
-              'mode': 'prw-r--r--',
-              'nlink': 2,
-              'mtime': 1565807019000000000,
-          },
-          '0socket': {
-              'mode': 'srw-r--r--',
-              'nlink': 2,
-              'mtime': 1565807019000000000,
-          },
-          'hlink-block': {
-              'mode': 'brw-r--r--',
-              'nlink': 1,
-              'mtime': 1565807019000000000,
-              'rdev': 2303,
-          },
-          'hlink-fifo': {
-              'mode': 'prw-r--r--',
-              'nlink': 2,
-              'mtime': 1565807019000000000,
-          },
-          'hlink-socket': {
-              'mode': 'srw-r--r--',
-              'nlink': 2,
-              'mtime': 1565807019000000000,
-          },
-      },
-      'hlink-symlink.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          '0regular': {
-              'mode': '-rw-r--r--',
-              'nlink': 1,
-              'size': 10,
-              'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
-          },
-          '1symlink': {
-              'mode': 'lrwxrwxrwx',
-              'nlink': 2,
-              'mtime': 1565807019000000000,
-              'target': '0regular',
-          },
-          'hlink': {
-              'mode': 'lrwxrwxrwx',
-              'nlink': 2,
-              'mtime': 1565807019000000000,
-              'target': '0regular',
-          },
-      },
-      'hlink-without-target.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          'hlink1': {
-              'mode': '-rw-r--r--',
-              'nlink': 1,
-              'mtime': 1565807019000000000,
-              'size': 0,
-              'md5': 'd41d8cd98f00b204e9800998ecf8427e',
-          },
-      },
-      'issue-43.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 3},
-          'README': {
-              'nlink': 1,
-              'mtime': 1265521877000000000,
-              'size': 760,
-              'md5': 'f196d610d1cdf9191b4440863e8d31ab',
-          },
-          'a': {'nlink': 3},
-          'a/b': {'nlink': 3},
-          'a/b/c': {'nlink': 3},
-          'a/b/c/d': {'nlink': 3},
-          'a/b/c/d/e': {'nlink': 3},
-          'a/b/c/d/e/f': {'nlink': 2},
-          'a/b/c/d/e/f/g': {
-              'nlink': 1,
-              'mtime': 1425893690000000000,
-              'size': 32,
-              'md5': '21977dc7948b88fdefd50f77afc9ac7b',
-          },
-          'a/b/c/d/e/f/g2': {
-              'nlink': 1,
-              'mtime': 1425893719000000000,
-              'size': 32,
-              'md5': '74ad09827032bc0be935c23c53f8ee29',
-          },
-      },
-      'lzma.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          'lzma.txt': {
-              'nlink': 1,
-              'size': 35,
-              # 'md5': 'afcc577cec75357c61cc360e3bca0ac6',
-          },
-      },
-      'mixed-paths.zip': {
+def TestArchiveWithDefaultOptions():
+    want_trees = {
+        'absolute-path.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            'rootname.ext': {
+                'nlink': 1,
+                'size': 22,
+                'md5': '8b4cc90d421780e7674e2a25db33b770',
+            },
+        },
+        'bad-archive.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            'bash.txt': {
+                'nlink': 1,
+                'mtime': 1265257351000000000,
+                'size': 282292,
+                'errno': 5,
+            },
+        },
+        'bad-crc.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            'bash.txt': {
+                'nlink': 1,
+                'mtime': 1265257351000000000,
+                'size': 282292,
+                'errno': 5,
+            },
+        },
+        'bzip2.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            'bzip2.txt': {
+                'nlink': 1,
+                'size': 36,
+                'md5': 'f28623c0be8da636e6c53ead06ce0731',
+            },
+        },
+        'comment-utf8.zip': {
+            '.': {
+                'nlink': 2,
+                'mtime': 1563727169000000000,
+            },
+            'empty_comment.txt': {
+                'nlink': 1,
+                'mtime': 1563721364000000000,
+                'size': 14,
+                'md5': '3453ff2f4d15a71d21e859829f0da9fc',
+            },
+            'with_comment.txt': {
+                'nlink': 1,
+                'mtime': 1563720300000000000,
+                'size': 13,
+                'md5': '557fcaa19da1b3e2cd6ce8e546a13f46',
+            },
+            'without_comment.txt': {
+                'nlink': 1,
+                'mtime': 1563720306000000000,
+                'size': 16,
+                'md5': '4cdf349a6dc1516f9642ebaf278af394',
+            },
+        },
+        'comment.zip': {
+            '.': {
+                'nlink': 2,
+                'mtime': 1563727169000000000,
+            },
+            'empty_comment.txt': {
+                'nlink': 1,
+                'mtime': 1563721364000000000,
+                'size': 14,
+                'md5': '3453ff2f4d15a71d21e859829f0da9fc',
+            },
+            'with_comment.txt': {
+                'nlink': 1,
+                'mtime': 1563720300000000000,
+                'size': 13,
+                'md5': '557fcaa19da1b3e2cd6ce8e546a13f46',
+            },
+            'without_comment.txt': {
+                'nlink': 1,
+                'mtime': 1563720306000000000,
+                'size': 16,
+                'md5': '4cdf349a6dc1516f9642ebaf278af394',
+            },
+        },
+        'dos-perm.zip': {
+            '.': {
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            'hidden.txt': {
+                'nlink': 1,
+                'size': 11,
+                'md5': 'fa29ea74a635e3be468256f9007b1bb6',
+            },
+            'normal.txt': {
+                'nlink': 1,
+                'size': 11,
+                'md5': '050256c2ac1d77494b9fddaa933f5eda',
+            },
+            'readonly.txt': {
+                'nlink': 1,
+                'size': 14,
+                'md5': '6f651ad751dadd4e76c8f46b6fae0c48',
+            },
+        },
+        'empty.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+        },
+        'extrafld.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            'README': {
+                'nlink': 1,
+                'mtime': 1372483540000000000,
+                'size': 2551,
+                'md5': '27d03e3bb5ed8add7917810c3ba68836',
+            },
+        },
+        'fifo.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            '-': {
+                'mode': '-rw-r--r--',
+                'nlink': 1,
+                'size': 14,
+                'md5': '42e16527aee5fe43ffa78a89d36a244c',
+            },
+            'fifo': {
+                'mode': '-rw-r--r--',
+                'nlink': 1,
+                'mtime': 1564428868000000000,
+                'size': 13,
+                'md5': 'd36dcce71b10bb7dd348ab6efb1c4aab',
+            },
+        },
+        'file-dir-same-name.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 3
+            },
+            'pet': {
+                'nlink': 3
+            },
+            'pet/cat': {
+                'nlink': 3
+            },
+            'pet/cat/fish': {
+                'nlink': 2,
+            },
+            'pet/cat/fish (1)': {
+                'nlink': 1,
+                'size': 30,
+                'md5': '47661a04dfd111f95ec5b02c4a1dab05',
+            },
+            'pet/cat/fish (2)': {
+                'nlink': 1,
+                'size': 31,
+                'md5': '4969fad4edba3582a114f17000583344',
+            },
+            'pet/cat (1)': {
+                'nlink': 1,
+                'size': 25,
+                'md5': '3a3cd8d02b1a2a232e2684258f38c882',
+            },
+            'pet/cat (2)': {
+                'nlink': 1,
+                'size': 26,
+                'md5': '07691c6ecc5be713b8d1224446f20970',
+            },
+            'pet (1)': {
+                'nlink': 1,
+                'size': 21,
+                'md5': '185743d56c5a917f02e2193a96effb25',
+            },
+            'pet (2)': {
+                'nlink': 1,
+                'size': 22,
+                'md5': 'ec5ffb0de216fb1e9578bc17a169399a',
+            },
+        },
+        'foobar.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            'foo': {
+                'nlink': 1,
+                'mtime': 1565484162000000000,
+                'size': 4,
+                'md5': 'c157a79031e1c40f85931829bc5fc552',
+            },
+        },
+        '--help': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            'foo': {
+                'nlink': 1,
+                'mtime': 1565484162000000000,
+                'size': 4,
+                'md5': 'c157a79031e1c40f85931829bc5fc552',
+            },
+        },
+        'hlink-before-target.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            '0hlink': {
+                'nlink': 2,
+                'size': 10,
+                'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
+            },
+            '1regular': {
+                'nlink': 2,
+                'size': 10,
+                'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
+            },
+        },
+        'hlink-chain.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            '0regular': {
+                'nlink': 3,
+                'size': 10,
+                'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
+            },
+            'hlink1': {
+                'nlink': 3,
+                'size': 10,
+                'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
+            },
+            'hlink2': {
+                'nlink': 3,
+                'size': 10,
+                'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
+            },
+        },
+        'hlink-different-types.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 3
+            },
+            'dir': {
+                'nlink': 2,
+            },
+            'dir/regular': {
+                'nlink': 1,
+                'size': 10,
+                'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
+            },
+            'hlink': {
+                'nlink': 1,
+                'size': 0,
+                'md5': 'd41d8cd98f00b204e9800998ecf8427e',
+            },
+        },
+        'hlink-dir.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 4
+            },
+            'dir': {
+                'nlink': 2,
+            },
+            'dir/regular': {
+                'nlink': 1,
+                'size': 10,
+                'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
+            },
+            'hlink': {
+                'nlink': 2,
+            },
+        },
+        'hlink-recursive-one.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            'hlink': {
+                'nlink': 1,
+                'mtime': 1565807019000000000,
+                'size': 0,
+                'md5': 'd41d8cd98f00b204e9800998ecf8427e',
+            },
+        },
+        'hlink-recursive-two.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            'hlink1': {
+                'nlink': 2,
+                'mtime': 1565807019000000000,
+                'size': 0,
+                'md5': 'd41d8cd98f00b204e9800998ecf8427e',
+            },
+            'hlink2': {
+                'nlink': 2,
+                'mtime': 1565807019000000000,
+                'size': 0,
+                'md5': 'd41d8cd98f00b204e9800998ecf8427e',
+            },
+        },
+        'hlink-relative.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            '0regular': {
+                'nlink': 2,
+                'size': 10,
+                'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
+            },
+            'hlink': {
+                'nlink': 2,
+                'size': 10,
+                'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
+            },
+        },
+        'hlink-special.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            '0block': {
+                'mode': 'brw-r--r--',
+                'nlink': 1,
+                'mtime': 1565807019000000000,
+                'rdev': 2303,
+            },
+            '0fifo': {
+                'mode': 'prw-r--r--',
+                'nlink': 2,
+                'mtime': 1565807019000000000,
+            },
+            '0socket': {
+                'mode': 'srw-r--r--',
+                'nlink': 2,
+                'mtime': 1565807019000000000,
+            },
+            'hlink-block': {
+                'mode': 'brw-r--r--',
+                'nlink': 1,
+                'mtime': 1565807019000000000,
+                'rdev': 2303,
+            },
+            'hlink-fifo': {
+                'mode': 'prw-r--r--',
+                'nlink': 2,
+                'mtime': 1565807019000000000,
+            },
+            'hlink-socket': {
+                'mode': 'srw-r--r--',
+                'nlink': 2,
+                'mtime': 1565807019000000000,
+            },
+        },
+        'hlink-symlink.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            '0regular': {
+                'mode': '-rw-r--r--',
+                'nlink': 1,
+                'size': 10,
+                'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
+            },
+            '1symlink': {
+                'mode': 'lrwxrwxrwx',
+                'nlink': 2,
+                'mtime': 1565807019000000000,
+                'target': '0regular',
+            },
+            'hlink': {
+                'mode': 'lrwxrwxrwx',
+                'nlink': 2,
+                'mtime': 1565807019000000000,
+                'target': '0regular',
+            },
+        },
+        'hlink-without-target.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            'hlink1': {
+                'mode': '-rw-r--r--',
+                'nlink': 1,
+                'mtime': 1565807019000000000,
+                'size': 0,
+                'md5': 'd41d8cd98f00b204e9800998ecf8427e',
+            },
+        },
+        'issue-43.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 3
+            },
+            'README': {
+                'nlink': 1,
+                'mtime': 1265521877000000000,
+                'size': 760,
+                'md5': 'f196d610d1cdf9191b4440863e8d31ab',
+            },
+            'a': {'nlink': 3},
+            'a/b': {'nlink': 3},
+            'a/b/c': {'nlink': 3},
+            'a/b/c/d': {'nlink': 3},
+            'a/b/c/d/e': {'nlink': 3},
+            'a/b/c/d/e/f': {'nlink': 2},
+            'a/b/c/d/e/f/g': {
+                'nlink': 1,
+                'mtime': 1425893690000000000,
+                'size': 32,
+                'md5': '21977dc7948b88fdefd50f77afc9ac7b',
+            },
+            'a/b/c/d/e/f/g2': {
+                'nlink': 1,
+                'mtime': 1425893719000000000,
+                'size': 32,
+                'md5': '74ad09827032bc0be935c23c53f8ee29',
+            },
+        },
+        'lzma.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            'lzma.txt': {
+                'nlink': 1,
+                'size': 35,
+                # 'md5': 'afcc577cec75357c61cc360e3bca0ac6',
+            },
+        },
+        'mixed-paths.zip': {
           '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 7},
           "Quote ' (1)": {'md5': '3ca0f2a7d572f3ad256fcd13e39bd8da'},
           "Quote ' (2)": {'md5': '60e20f9b84bf0fe96e7d226341aaf72d'},
@@ -946,387 +1133,457 @@ def TestZipWithDefaultOptions():
           'Three Levels Up (1)': {'md5': '5d7122fa28bb1886d90cdbaee7b8b630'},
           'Three Levels Up (2)': {'md5': '69baf719bc3af25f12c86a2c146ab491'},
           'Three Levels Up': {'md5': '77798d1b2b8f820dbf742a6416d2fd51'},
-      },
-      'no-owner-info.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          'README': {
-              'mode': '-rw-r--r--',
-              'nlink': 1,
-              'size': 760,
-              'md5': 'f196d610d1cdf9191b4440863e8d31ab',
-          },
-      },
-      'not-full-path-deep.zip': {
-          '.': {'nlink': 3},
-          'rahat': {'nlink': 2},
-          'rahat/lukum': {
-              'nlink': 1,
-              'size': 10,
-              'md5': '16c52c6e8326c071da771e66dc6e9e57',
-          },
-          'rahat-lukum': {
-              'nlink': 1,
-              'size': 10,
-              'md5': '38b18761d3d0c217371967a98d545c2e',
-          },
-      },
-      'not-full-path.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 3},
-          'bebebe': {
-              'nlink': 1,
-              'mtime': 1291639841000000000,
-              'size': 5,
-              'md5': '655dba24211af27d85c3cc4a910cc2ef',
-          },
-          'foo': {'nlink': 2},
-          'foo/bar': {
-              'nlink': 1,
-              'mtime': 1291630409000000000,
-              'size': 10,
-              'md5': '10a28a91b53776aaf0800d68eb260eb6',
-          },
-      },
-      'ntfs-extrafld.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          'test.txt': {
-              'mode': '-rw-r--r--',
-              'nlink': 1,
-              'mtime': 1560435721722114700,
-              'size': 2600,
-              'errno': 5,
-          },
-      },
-      'parent-relative-paths.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 3},
-          'other': {'nlink': 2},
-          'other/LICENSE': {
-              'nlink': 1,
-              'mtime': 1371459156000000000,
-              'size': 7639,
-              'md5': '6a6a8e020838b23406c81b19c1d46df6',
-          },
-          'INSTALL': {
-              'nlink': 1,
-              'mtime': 1371459066000000000,
-              'size': 454,
-              'md5': '2ffc1c72359e389608ec4de36c6d1fac',
-          },
-      },
-      'pkware-specials.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          'block': {
-              'mode': 'brw-r--r--',
-              'nlink': 1,
-              'mtime': 1564833480000000000,
-              'rdev': 2049,
-          },
-          'char': {
-              'mode': 'crw-r--r--',
-              'nlink': 1,
-              'mtime': 1564833480000000000,
-              'rdev': 1024,
-          },
-          'fifo': {
-              'mode': 'prw-r--r--',
-              'nlink': 1,
-              'mtime': 1565809123000000000,
-          },
-          'regular': {
-              'mode': '-rw-r--r--',
-              'nlink': 3,
-              'mtime': 1565290018000000000,
-              'size': 32,
-              'md5': '456e611a5420b7dd09bae143a7b2deb0',
-          },
-          'socket': {
-              'mode': 'srw-r--r--',
-              'nlink': 1,
-              'mtime': 1564834444000000000,
-          },
-          'symlink': {
-              'mode': 'lrwxrwxrwx',
-              'nlink': 1,
-              'mtime': 1564834729000000000,
-              'target': 'regular',
-          },
-          'symlink2': {
-              'mode': 'lrwxrwxrwx',
-              'nlink': 1,
-              'mtime': 1566731354000000000,
-              'target': 'regular',
-          },
-          'z-hardlink-block': {
-              'mode': 'brw-r--r--',
-              'nlink': 1,
-              'mtime': 1564833480000000000,
-              'rdev': 2049,
-          },
-          'z-hardlink-char': {
-              'mode': 'crw-r--r--',
-              'nlink': 1,
-              'mtime': 1564833480000000000,
-              'rdev': 1024,
-          },
-          'z-hardlink-fifo': {
-              'mode': 'prw-r--r--',
-              'nlink': 1,
-              'mtime': 1565809123000000000,
-          },
-          'z-hardlink-socket': {
-              'mode': 'srw-r--r--',
-              'nlink': 1,
-              'mtime': 1564834444000000000,
-          },
-          'z-hardlink-symlink': {
-              'mode': 'lrwxrwxrwx',
-              'nlink': 1,
-              'mtime': 1564834729000000000,
-              'target': 'regular',
-          },
-          'z-hardlink1': {
-              'mode': '-rw-r--r--',
-              'nlink': 3,
-              'mtime': 1565290018000000000,
-              'size': 32,
-              'md5': '456e611a5420b7dd09bae143a7b2deb0',
-          },
-          'z-hardlink2': {
-              'mode': '-rw-r--r--',
-              'nlink': 3,
-              'mtime': 1565290018000000000,
-              'size': 32,
-              'md5': '456e611a5420b7dd09bae143a7b2deb0',
-          },
-      },
-      'pkware-symlink.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          'regular': {
-              'mode': '-rw-r--r--',
-              'nlink': 1,
-              'mtime': 1566730512000000000,
-              'size': 33,
-              'md5': '4404716d8a90c37fdc18d88b70d09fa3',
-          },
-          'symlink': {
-              'mode': 'lrwxrwxrwx',
-              'nlink': 1,
-              'mtime': 1566730517000000000,
-              'target': 'regular',
-          },
-      },
-      'sjis-filename.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          '新しいテキスト ドキュメント.txt': {
-              'nlink': 1,
-              'size': 0,
-              'md5': 'd41d8cd98f00b204e9800998ecf8427e',
-          },
-      },
-      'symlink.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          'date': {
-              'mode': '-rw-r--r--',
-              'nlink': 1,
-              'mtime': 1388943675000000000,
-              'size': 35,
-              'md5': 'e84bea37a02d9285935368412725b442',
-          },
-          'symlink': {
-              'mode': 'lrwxrwxrwx',
-              'nlink': 1,
-              'mtime': 1388943650000000000,
-              'target': '../tmp/date',
-          },
-      },
-      'unix-perm.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          '640': {
-              'mode': '-rw-r--r--',
-              'nlink': 1,
-              'mtime': 1388890728000000000,
-              'size': 0,
-              'md5': 'd41d8cd98f00b204e9800998ecf8427e',
-          },
-          '642': {
-              'mode': '-rw-r--r--',
-              'nlink': 1,
-              'mtime': 1388890755000000000,
-              'size': 0,
-              'md5': 'd41d8cd98f00b204e9800998ecf8427e',
-          },
-          '666': {
-              'mode': '-rw-r--r--',
-              'nlink': 1,
-              'mtime': 1388890728000000000,
-              'size': 0,
-              'md5': 'd41d8cd98f00b204e9800998ecf8427e',
-          },
-          '6775': {
-              'mode': '-rwxr-xr-x',
-              'nlink': 1,
-              'mtime': 1388890915000000000,
-              'size': 0,
-              'md5': 'd41d8cd98f00b204e9800998ecf8427e',
-          },
-          '777': {
-              'mode': '-rwxr-xr-x',
-              'nlink': 1,
-              'mtime': 1388890728000000000,
-              'size': 0,
-              'md5': 'd41d8cd98f00b204e9800998ecf8427e',
-          },
-      },
-      'with-and-without-precise-time.zip': {
-          '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-          'unmodified': {
-              'nlink': 1,
-              'mtime': 1564327465000000000,
-              'size': 7,
-              'md5': '88e6b9694d2fe3e0a47a898110ed44b6',
-          },
-          'with-precise': {
-              'nlink': 1,
-              'mtime': 1532741025123456700,
-              'size': 4,
-              'md5': '814fa5ca98406a903e22b43d9b610105',
-          },
-          'without-precise': {
-              'nlink': 1,
-              'mtime': 1532741025000000000,
-              'size': 4,
-              'md5': '814fa5ca98406a903e22b43d9b610105',
-          },
-      },
-  }
+        },
+        'no-owner-info.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            'README': {
+                'mode': '-rw-r--r--',
+                'nlink': 1,
+                'size': 760,
+                'md5': 'f196d610d1cdf9191b4440863e8d31ab',
+            },
+        },
+        'not-full-path-deep.zip': {
+            '.': {
+                'nlink': 3
+            },
+            'rahat': {
+                'nlink': 2
+            },
+            'rahat/lukum': {
+                'nlink': 1,
+                'size': 10,
+                'md5': '16c52c6e8326c071da771e66dc6e9e57',
+            },
+            'rahat-lukum': {
+                'nlink': 1,
+                'size': 10,
+                'md5': '38b18761d3d0c217371967a98d545c2e',
+            },
+        },
+        'not-full-path.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 3
+            },
+            'bebebe': {
+                'nlink': 1,
+                'mtime': 1291639841000000000,
+                'size': 5,
+                'md5': '655dba24211af27d85c3cc4a910cc2ef',
+            },
+            'foo': {
+                'nlink': 2
+            },
+            'foo/bar': {
+                'nlink': 1,
+                'mtime': 1291630409000000000,
+                'size': 10,
+                'md5': '10a28a91b53776aaf0800d68eb260eb6',
+            },
+        },
+        'ntfs-extrafld.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            'test.txt': {
+                'mode': '-rw-r--r--',
+                'nlink': 1,
+                'mtime': 1560435721722114700,
+                'size': 2600,
+                'errno': 5,
+            },
+        },
+        'parent-relative-paths.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 3
+            },
+            'other': {
+                'nlink': 2
+            },
+            'other/LICENSE': {
+                'nlink': 1,
+                'mtime': 1371459156000000000,
+                'size': 7639,
+                'md5': '6a6a8e020838b23406c81b19c1d46df6',
+            },
+            'INSTALL': {
+                'nlink': 1,
+                'mtime': 1371459066000000000,
+                'size': 454,
+                'md5': '2ffc1c72359e389608ec4de36c6d1fac',
+            },
+        },
+        'pkware-specials.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            'block': {
+                'mode': 'brw-r--r--',
+                'nlink': 1,
+                'mtime': 1564833480000000000,
+                'rdev': 2049,
+            },
+            'char': {
+                'mode': 'crw-r--r--',
+                'nlink': 1,
+                'mtime': 1564833480000000000,
+                'rdev': 1024,
+            },
+            'fifo': {
+                'mode': 'prw-r--r--',
+                'nlink': 1,
+                'mtime': 1565809123000000000,
+            },
+            'regular': {
+                'mode': '-rw-r--r--',
+                'nlink': 3,
+                'mtime': 1565290018000000000,
+                'size': 32,
+                'md5': '456e611a5420b7dd09bae143a7b2deb0',
+            },
+            'socket': {
+                'mode': 'srw-r--r--',
+                'nlink': 1,
+                'mtime': 1564834444000000000,
+            },
+            'symlink': {
+                'mode': 'lrwxrwxrwx',
+                'nlink': 1,
+                'mtime': 1564834729000000000,
+                'target': 'regular',
+            },
+            'symlink2': {
+                'mode': 'lrwxrwxrwx',
+                'nlink': 1,
+                'mtime': 1566731354000000000,
+                'target': 'regular',
+            },
+            'z-hardlink-block': {
+                'mode': 'brw-r--r--',
+                'nlink': 1,
+                'mtime': 1564833480000000000,
+                'rdev': 2049,
+            },
+            'z-hardlink-char': {
+                'mode': 'crw-r--r--',
+                'nlink': 1,
+                'mtime': 1564833480000000000,
+                'rdev': 1024,
+            },
+            'z-hardlink-fifo': {
+                'mode': 'prw-r--r--',
+                'nlink': 1,
+                'mtime': 1565809123000000000,
+            },
+            'z-hardlink-socket': {
+                'mode': 'srw-r--r--',
+                'nlink': 1,
+                'mtime': 1564834444000000000,
+            },
+            'z-hardlink-symlink': {
+                'mode': 'lrwxrwxrwx',
+                'nlink': 1,
+                'mtime': 1564834729000000000,
+                'target': 'regular',
+            },
+            'z-hardlink1': {
+                'mode': '-rw-r--r--',
+                'nlink': 3,
+                'mtime': 1565290018000000000,
+                'size': 32,
+                'md5': '456e611a5420b7dd09bae143a7b2deb0',
+            },
+            'z-hardlink2': {
+                'mode': '-rw-r--r--',
+                'nlink': 3,
+                'mtime': 1565290018000000000,
+                'size': 32,
+                'md5': '456e611a5420b7dd09bae143a7b2deb0',
+            },
+        },
+        'pkware-symlink.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            'regular': {
+                'mode': '-rw-r--r--',
+                'nlink': 1,
+                'mtime': 1566730512000000000,
+                'size': 33,
+                'md5': '4404716d8a90c37fdc18d88b70d09fa3',
+            },
+            'symlink': {
+                'mode': 'lrwxrwxrwx',
+                'nlink': 1,
+                'mtime': 1566730517000000000,
+                'target': 'regular',
+            },
+        },
+        'sjis-filename.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            '新しいテキスト ドキュメント.txt': {
+                'nlink': 1,
+                'size': 0,
+                'md5': 'd41d8cd98f00b204e9800998ecf8427e',
+            },
+        },
+        'symlink.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            'date': {
+                'mode': '-rw-r--r--',
+                'nlink': 1,
+                'mtime': 1388943675000000000,
+                'size': 35,
+                'md5': 'e84bea37a02d9285935368412725b442',
+            },
+            'symlink': {
+                'mode': 'lrwxrwxrwx',
+                'nlink': 1,
+                'mtime': 1388943650000000000,
+                'target': '../tmp/date',
+            },
+        },
+        'unix-perm.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            '640': {
+                'mode': '-rw-r--r--',
+                'nlink': 1,
+                'mtime': 1388890728000000000,
+                'size': 0,
+                'md5': 'd41d8cd98f00b204e9800998ecf8427e',
+            },
+            '642': {
+                'mode': '-rw-r--r--',
+                'nlink': 1,
+                'mtime': 1388890755000000000,
+                'size': 0,
+                'md5': 'd41d8cd98f00b204e9800998ecf8427e',
+            },
+            '666': {
+                'mode': '-rw-r--r--',
+                'nlink': 1,
+                'mtime': 1388890728000000000,
+                'size': 0,
+                'md5': 'd41d8cd98f00b204e9800998ecf8427e',
+            },
+            '6775': {
+                'mode': '-rwxr-xr-x',
+                'nlink': 1,
+                'mtime': 1388890915000000000,
+                'size': 0,
+                'md5': 'd41d8cd98f00b204e9800998ecf8427e',
+            },
+            '777': {
+                'mode': '-rwxr-xr-x',
+                'nlink': 1,
+                'mtime': 1388890728000000000,
+                'size': 0,
+                'md5': 'd41d8cd98f00b204e9800998ecf8427e',
+            },
+        },
+        'with-and-without-precise-time.zip': {
+            '.': {
+                'ino': 1,
+                'mode': 'drwxr-xr-x',
+                'nlink': 2
+            },
+            'unmodified': {
+                'nlink': 1,
+                'mtime': 1564327465000000000,
+                'size': 7,
+                'md5': '88e6b9694d2fe3e0a47a898110ed44b6',
+            },
+            'with-precise': {
+                'nlink': 1,
+                'mtime': 1532741025123456700,
+                'size': 4,
+                'md5': '814fa5ca98406a903e22b43d9b610105',
+            },
+            'without-precise': {
+                'nlink': 1,
+                'mtime': 1532741025000000000,
+                'size': 4,
+                'md5': '814fa5ca98406a903e22b43d9b610105',
+            },
+        },
+    }
 
-  for zip_name, want_tree in want_trees.items():
-    MountZipAndCheckTree(zip_name, want_tree, options=['-o', 'force'])
+    for zip_name, want_tree in want_trees.items():
+        MountArchiveAndCheckTree(zip_name, want_tree, options=['-o', 'force'])
 
 
 # Tests mounting several ZIPs at the same time.
 def TestMultiple():
-  want_tree = {
-      '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-      '0regular': {
-          'ino': 2,
-          'mode': '-rw-r--r--',
-          'nlink': 2,
-          'size': 10,
-          'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
-      },
-      'hlink': {
-          'ino': 2,
-          'mode': '-rw-r--r--',
-          'nlink': 2,
-          'size': 10,
-          'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
-      },
-      '0regular (1)': {
-          'ino': 4,
-          'mode': '-rw-r--r--',
-          'nlink': 2,
-          'size': 10,
-          'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
-      },
-      'hlink (1)': {
-          'ino': 4,
-          'mode': '-rw-r--r--',
-          'nlink': 2,
-          'size': 10,
-          'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
-      },
-  }
+    want_tree = {
+        '.': {
+            'ino': 1,
+            'mode': 'drwxr-xr-x',
+            'nlink': 2
+        },
+        '0regular': {
+            'ino': 2,
+            'mode': '-rw-r--r--',
+            'nlink': 2,
+            'size': 10,
+            'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
+        },
+        'hlink': {
+            'ino': 2,
+            'mode': '-rw-r--r--',
+            'nlink': 2,
+            'size': 10,
+            'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
+        },
+        '0regular (1)': {
+            'ino': 4,
+            'mode': '-rw-r--r--',
+            'nlink': 2,
+            'size': 10,
+            'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
+        },
+        'hlink (1)': {
+            'ino': 4,
+            'mode': '-rw-r--r--',
+            'nlink': 2,
+            'size': 10,
+            'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
+        },
+    }
 
-  MountZipAndCheckTree(['hlink-relative.zip', 'hlink-relative.zip'], want_tree)
+    MountArchiveAndCheckTree(['hlink-relative.zip', 'hlink-relative.zip'],
+                         want_tree)
 
-  want_tree = {
-      '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-      '0regular': {
-          'ino': 2,
-          'mode': '-rw-r--r--',
-          'nlink': 2,
-          'size': 10,
-          'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
-      },
-      'hlink': {
-          'ino': 2,
-          'mode': '-rw-r--r--',
-          'nlink': 2,
-          'size': 10,
-          'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
-      },
-      '0regular (1)': {
-          'ino': 4,
-          'mode': '-rw-r--r--',
-          'nlink': 1,
-          'size': 10,
-          'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
-      },
-      '1symlink': {
-          'ino': 5,
-          'mode': 'lrwxrwxrwx',
-          'nlink': 2,
-          'target': '0regular',
-      },
-      'hlink (1)': {
-          'ino': 5,
-          'mode': 'lrwxrwxrwx',
-          'nlink': 2,
-          'target': '0regular',
-      },
-  }
+    want_tree = {
+        '.': {
+            'ino': 1,
+            'mode': 'drwxr-xr-x',
+            'nlink': 2
+        },
+        '0regular': {
+            'ino': 2,
+            'mode': '-rw-r--r--',
+            'nlink': 2,
+            'size': 10,
+            'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
+        },
+        'hlink': {
+            'ino': 2,
+            'mode': '-rw-r--r--',
+            'nlink': 2,
+            'size': 10,
+            'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
+        },
+        '0regular (1)': {
+            'ino': 4,
+            'mode': '-rw-r--r--',
+            'nlink': 1,
+            'size': 10,
+            'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
+        },
+        '1symlink': {
+            'ino': 5,
+            'mode': 'lrwxrwxrwx',
+            'nlink': 2,
+            'target': '0regular',
+        },
+        'hlink (1)': {
+            'ino': 5,
+            'mode': 'lrwxrwxrwx',
+            'nlink': 2,
+            'target': '0regular',
+        },
+    }
 
-  MountZipAndCheckTree(['hlink-relative.zip', 'hlink-symlink.zip'], want_tree)
+    MountArchiveAndCheckTree(['hlink-relative.zip', 'hlink-symlink.zip'],
+                         want_tree)
 
-  want_tree = {
-      '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 4},
-      'hlink-relative': {'ino': 2, 'mode': 'drwxr-xr-x', 'nlink': 2},
-      'hlink-relative/0regular': {
-          'ino': 3,
-          'mode': '-rw-r--r--',
-          'nlink': 2,
-          'size': 10,
-          'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
-      },
-      'hlink-relative/hlink': {
-          'ino': 3,
-          'mode': '-rw-r--r--',
-          'nlink': 2,
-          'size': 10,
-          'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
-      },
-      'hlink-symlink': {'ino': 5, 'mode': 'drwxr-xr-x', 'nlink': 2},
-      'hlink-symlink/0regular': {
-          'ino': 6,
-          'mode': '-rw-r--r--',
-          'nlink': 1,
-          'size': 10,
-          'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
-      },
-      'hlink-symlink/1symlink': {
-          'ino': 7,
-          'mode': 'lrwxrwxrwx',
-          'nlink': 2,
-          'target': '0regular',
-      },
-      'hlink-symlink/hlink': {
-          'ino': 7,
-          'mode': 'lrwxrwxrwx',
-          'nlink': 2,
-          'target': '0regular',
-      },
-  }
+    want_tree = {
+        '.': {
+            'ino': 1,
+            'mode': 'drwxr-xr-x',
+            'nlink': 4
+        },
+        'hlink-relative': {
+            'ino': 2,
+            'mode': 'drwxr-xr-x',
+            'nlink': 2
+        },
+        'hlink-relative/0regular': {
+            'ino': 3,
+            'mode': '-rw-r--r--',
+            'nlink': 2,
+            'size': 10,
+            'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
+        },
+        'hlink-relative/hlink': {
+            'ino': 3,
+            'mode': '-rw-r--r--',
+            'nlink': 2,
+            'size': 10,
+            'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
+        },
+        'hlink-symlink': {
+            'ino': 5,
+            'mode': 'drwxr-xr-x',
+            'nlink': 2
+        },
+        'hlink-symlink/0regular': {
+            'ino': 6,
+            'mode': '-rw-r--r--',
+            'nlink': 1,
+            'size': 10,
+            'md5': 'e09c80c42fda55f9d992e59ca6b3307d',
+        },
+        'hlink-symlink/1symlink': {
+            'ino': 7,
+            'mode': 'lrwxrwxrwx',
+            'nlink': 2,
+            'target': '0regular',
+        },
+        'hlink-symlink/hlink': {
+            'ino': 7,
+            'mode': 'lrwxrwxrwx',
+            'nlink': 2,
+            'target': '0regular',
+        },
+    }
 
-  MountZipAndCheckTree(
-      ['hlink-relative.zip', 'hlink-symlink.zip'],
-      want_tree,
-      options=['-o', 'nomerge'],
-  )
+    MountArchiveAndCheckTree(
+        ['hlink-relative.zip', 'hlink-symlink.zip'],
+        want_tree,
+        options=['-o', 'nomerge'],
+    )
 
 
 # Tests -o dmask, fmask and default_permissions.
 def TestMasks():
-  want_tree = {
+    want_tree = {
       '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 24},
       'Dir000': {'mode': 'drwxr-xr-x'},
       'Dir001': {'mode': 'drwxr-xr-x'},
@@ -1372,11 +1629,11 @@ def TestMasks():
       'File500': {'mode': '-rwxr-xr-x'},
       'File600': {'mode': '-rw-r--r--'},
       'File700': {'mode': '-rwxr-xr-x'},
-  }
+    }
 
-  MountZipAndCheckTree('permissions.zip', want_tree, use_md5=False)
+    MountArchiveAndCheckTree('permissions.zip', want_tree, use_md5=False)
 
-  want_tree = {
+    want_tree = {
       '.': {'ino': 1, 'mode': 'drwx------', 'nlink': 24},
       'Dir000': {'mode': 'drwx------'},
       'Dir001': {'mode': 'drwx------'},
@@ -1422,13 +1679,14 @@ def TestMasks():
       'File500': {'mode': '-rwxr-xr-x'},
       'File600': {'mode': '-rw-r--r--'},
       'File700': {'mode': '-rwxr-xr-x'},
-  }
+    }
 
-  MountZipAndCheckTree(
-      'permissions.zip', want_tree, use_md5=False, options=['-o', 'dmask=077']
-  )
+    MountArchiveAndCheckTree('permissions.zip',
+                         want_tree,
+                         use_md5=False,
+                         options=['-o', 'dmask=077'])
 
-  want_tree = {
+    want_tree = {
       '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 24},
       'Dir000': {'mode': 'drwxr-xr-x'},
       'Dir001': {'mode': 'drwxr-xr-x'},
@@ -1474,13 +1732,14 @@ def TestMasks():
       'File500': {'mode': '-rwx------'},
       'File600': {'mode': '-rw-------'},
       'File700': {'mode': '-rwx------'},
-  }
+    }
 
-  MountZipAndCheckTree(
-      'permissions.zip', want_tree, use_md5=False, options=['-o', 'fmask=077']
-  )
+    MountArchiveAndCheckTree('permissions.zip',
+                         want_tree,
+                         use_md5=False,
+                         options=['-o', 'fmask=077'])
 
-  want_tree = {
+    want_tree = {
       '.': {'ino': 1, 'mode': 'drwxrwxrwx', 'nlink': 24},
       'Dir000': {'mode': 'drwxrwxrwx'},
       'Dir001': {'mode': 'drwxrwxrwx'},
@@ -1526,16 +1785,16 @@ def TestMasks():
       'File500': {'mode': '-rwxrwxrwx'},
       'File600': {'mode': '-rw-rw-rw-'},
       'File700': {'mode': '-rwxrwxrwx'},
-  }
+    }
 
-  MountZipAndCheckTree(
-      'permissions.zip',
-      want_tree,
-      use_md5=False,
-      options=['-o', 'dmask=0,fmask=0'],
-  )
+    MountArchiveAndCheckTree(
+        'permissions.zip',
+        want_tree,
+        use_md5=False,
+        options=['-o', 'dmask=0,fmask=0'],
+    )
 
-  want_tree = {
+    want_tree = {
       '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 24},
       'Dir000': {'uid': 270632, 'gid': 89939, 'mode': 'd---------'},
       'Dir001': {'uid': 270632, 'gid': 89939, 'mode': 'd--------x'},
@@ -1581,16 +1840,16 @@ def TestMasks():
       'File500': {'uid': 270632, 'gid': 89939, 'mode': '-r-x------'},
       'File600': {'uid': 270632, 'gid': 89939, 'mode': '-rw-------'},
       'File700': {'uid': 270632, 'gid': 89939, 'mode': '-rwx------'},
-  }
+    }
 
-  MountZipAndCheckTree(
-      'permissions.zip',
-      want_tree,
-      use_md5=False,
-      options=['-o', 'default_permissions'],
-  )
+    MountArchiveAndCheckTree(
+        'permissions.zip',
+        want_tree,
+        use_md5=False,
+        options=['-o', 'default_permissions'],
+    )
 
-  want_tree = {
+    want_tree = {
       '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 24},
       'Dir000': {'uid': 270632, 'gid': 89939, 'mode': 'd---------'},
       'Dir001': {'uid': 270632, 'gid': 89939, 'mode': 'd--------x'},
@@ -1636,144 +1895,103 @@ def TestMasks():
       'File500': {'uid': 270632, 'gid': 89939, 'mode': '-r-x------'},
       'File600': {'uid': 270632, 'gid': 89939, 'mode': '-rw-------'},
       'File700': {'uid': 270632, 'gid': 89939, 'mode': '-rwx------'},
-  }
+    }
 
-  MountZipAndCheckTree(
-      'permissions.zip',
-      want_tree,
-      use_md5=False,
-      options=['-o', 'default_permissions,dmask=0,fmask=0'],
-  )
+    MountArchiveAndCheckTree(
+        'permissions.zip',
+        want_tree,
+        use_md5=False,
+        options=['-o', 'default_permissions,dmask=0,fmask=0'],
+    )
 
 
 # Tests the ZIP with lots of files.
-def TestZipWithManyFiles():
-  # Only check a few files: the first one, the last one, and one in the middle.
-  want_tree = {
-      '1': {
-          'mode': '-rw-r--r--',
-          'nlink': 1,
-          'mtime': 1371243195000000000,
-          'size': 0,
-      },
-      '30000': {
-          'mode': '-rw-r--r--',
-          'nlink': 1,
-          'mtime': 1371243200000000000,
-          'size': 0,
-      },
-      '65536': {
-          'mode': '-rw-r--r--',
-          'nlink': 1,
-          'mtime': 1371243206000000000,
-          'size': 0,
-      },
-  }
+def TestArchiveWithManyFiles():
+    if is_fast: return
 
-  MountZipAndCheckTree(
-      '65536-files.zip',
-      want_tree,
-      want_blocks=65537,
-      want_inodes=65537,
-      strict=False,
-      use_md5=False,
-  )
+    # Only check a few files: the first one, the last one, and one in the middle.
+    want_tree = {
+        '1': {
+            'mode': '-rw-r--r--',
+            'nlink': 1,
+            'mtime': 1371243195000000000,
+            'size': 0,
+        },
+        '30000': {
+            'mode': '-rw-r--r--',
+            'nlink': 1,
+            'mtime': 1371243200000000000,
+            'size': 0,
+        },
+        '65536': {
+            'mode': '-rw-r--r--',
+            'nlink': 1,
+            'mtime': 1371243206000000000,
+            'size': 0,
+        },
+    }
 
-  want_tree = {
-      'a/b/c/d/e/f/g/h/i/j/There are many versions of this file': {
-          'size': 0,
-      },
-      'a/b/c/d/e/f/g/h/i/j/There are many versions of this file (1)': {
-          'size': 0,
-      },
-      'a/b/c/d/e/f/g/h/i/j/There are many versions of this file (2)': {
-          'size': 18,
-      },
-      'a/b/c/d/e/f/g/h/i/j/There are many versions of this file (3)': {
-          'size': 0,
-      },
-      'a/b/c/d/e/f/g/h/i/j/There are many versions of this file (4)': {
-          'size': 19,
-      },
-      'a/b/c/d/e/f/g/h/i/j/There are many versions of this file (5)': {
-          'size': 0,
-      },
-      'a/b/c/d/e/f/g/h/i/j/There are many versions of this file (50000)': {
-          'size': 0,
-      },
-      'a/b/c/d/e/f/g/h/i/j/There are many versions of this file (99999)': {
-          'size': 0,
-      },
-      'a/b/c/d/e/f/g/h/i/j/There are many versions of this file (100000)': {
-          'size': 0,
-      },
-      'a/b/c/d/e/f/g/h/i/j/There are many versions of this file (100001)': {
-          'size': 0,
-      },
-      'a/b/c/d/e/f/g/h/i/j/There are many versions of this file (100002)': {
-          'size': 8,
-      },
-  }
+    MountArchiveAndCheckTree(
+        '65536-files.zip',
+        want_tree,
+        want_blocks=65537,
+        want_inodes=65537,
+        strict=False,
+        use_md5=False,
+    )
 
-  MountZipAndCheckTree(
-      'collisions.zip',
-      want_tree,
-      options=['-o', 'notrim'],
-      want_blocks=100007,
-      want_inodes=100014,
-      strict=False,
-      use_md5=False,
-  )
+    want_tree = {
+        'a/b/c/d/e/f/g/h/i/j/There are many versions of this file': {'size': 0},
+        'a/b/c/d/e/f/g/h/i/j/There are many versions of this file (1)': {'size': 0},
+        'a/b/c/d/e/f/g/h/i/j/There are many versions of this file (2)': {'size': 18},
+        'a/b/c/d/e/f/g/h/i/j/There are many versions of this file (3)': {'size': 0},
+        'a/b/c/d/e/f/g/h/i/j/There are many versions of this file (4)': {'size': 19},
+        'a/b/c/d/e/f/g/h/i/j/There are many versions of this file (5)': {'size': 0},
+        'a/b/c/d/e/f/g/h/i/j/There are many versions of this file (50000)': {'size': 0},
+        'a/b/c/d/e/f/g/h/i/j/There are many versions of this file (99999)': {'size': 0},
+        'a/b/c/d/e/f/g/h/i/j/There are many versions of this file (100000)': {'size': 0},
+        'a/b/c/d/e/f/g/h/i/j/There are many versions of this file (100001)': {'size': 0},
+        'a/b/c/d/e/f/g/h/i/j/There are many versions of this file (100002)': {'size': 8},
+    }
 
-  want_tree = {
-      'There are many versions of this file': {
-          'size': 0,
-      },
-      'There are many versions of this file (1)': {
-          'size': 0,
-      },
-      'There are many versions of this file (2)': {
-          'size': 18,
-      },
-      'There are many versions of this file (3)': {
-          'size': 0,
-      },
-      'There are many versions of this file (4)': {
-          'size': 19,
-      },
-      'There are many versions of this file (5)': {
-          'size': 0,
-      },
-      'There are many versions of this file (50000)': {
-          'size': 0,
-      },
-      'There are many versions of this file (99999)': {
-          'size': 0,
-      },
-      'There are many versions of this file (100000)': {
-          'size': 0,
-      },
-      'There are many versions of this file (100001)': {
-          'size': 0,
-      },
-      'There are many versions of this file (100002)': {
-          'size': 8,
-      },
-  }
+    MountArchiveAndCheckTree(
+        'collisions.zip',
+        want_tree,
+        options=['-o', 'notrim'],
+        want_blocks=100007,
+        want_inodes=100014,
+        strict=False,
+        use_md5=False,
+    )
 
-  MountZipAndCheckTree(
-      'collisions.zip',
-      want_tree,
-      options=[],
-      want_blocks=99997,
-      want_inodes=100004,
-      strict=False,
-      use_md5=False,
-  )
+    want_tree = {
+        'There are many versions of this file': {'size': 0},
+        'There are many versions of this file (1)': {'size': 0},
+        'There are many versions of this file (2)': {'size': 18},
+        'There are many versions of this file (3)': {'size': 0},
+        'There are many versions of this file (4)': {'size': 19},
+        'There are many versions of this file (5)': {'size': 0},
+        'There are many versions of this file (50000)': {'size': 0},
+        'There are many versions of this file (99999)': {'size': 0},
+        'There are many versions of this file (100000)': {'size': 0},
+        'There are many versions of this file (100001)': {'size': 0},
+        'There are many versions of this file (100002)': {'size': 8},
+    }
+
+    MountArchiveAndCheckTree(
+        'collisions.zip',
+        want_tree,
+        options=[],
+        want_blocks=99997,
+        want_inodes=100004,
+        strict=False,
+        use_md5=False,
+    )
+
 
 # Tests archives with lots of directories or with the `nodir` option.
 def TestDirectories():
-  want_tree = {
+    want_tree = {
     '.': {'mode': 'drwxr-xr-x', 'nlink': 2},
     'pwn.txt': {'mode': '-rw-r--r--', 'size': 18, 'md5': 'd733c7099812e836812eaee2516fe4d4'},
     'pwn (1).txt': {'mode': '-rw-r--r--', 'size': 18, 'md5': '60657c4791d6bad79b828cf95885b7ab'},
@@ -1809,11 +2027,16 @@ def TestDirectories():
     'pwn (31).txt': {'mode': '-rw-r--r--', 'size': 14, 'md5': '2bfcd9de11861f7af0c01e3d91bd56dd'},
     'pwn (32).txt': {'mode': '-rw-r--r--', 'size': 14, 'md5': '3e9fed35b8275175ae5841a24b3a5a2d'},
     'pwn (33).txt': {'mode': '-rw-r--r--', 'size': 14, 'md5': 'a46776ca9d8e292b7cf4358c449d258b'},
-  }
+    }
 
-  MountZipAndCheckTree('deep.zip', want_tree, options=['-o', 'nodirs'], want_blocks=69, want_inodes=35, strict=False)
+    MountArchiveAndCheckTree('deep.zip',
+                         want_tree,
+                         options=['-o', 'nodirs'],
+                         want_blocks=69,
+                         want_inodes=35,
+                         strict=False)
 
-  want_tree = {
+    want_tree = {
     '.': {'mode': 'drwxr-xr-x', 'nlink': 4},
     'Too Deep': {'mode': 'drwxr-xr-x', 'nlink': 2},
     'Too Deep/pwn.txt': {'mode': '-rw-r--r--', 'size': 18, 'md5': 'd733c7099812e836812eaee2516fe4d4'},
@@ -1850,288 +2073,320 @@ def TestDirectories():
     'a/' * 3 + 'pwn.txt': {'mode': '-rw-r--r--', 'size': 14, 'md5': '2bfcd9de11861f7af0c01e3d91bd56dd'},
     'a/' * 2 + 'pwn.txt': {'mode': '-rw-r--r--', 'size': 14, 'md5': '3e9fed35b8275175ae5841a24b3a5a2d'},
     'a/pwn.txt': {'mode': '-rw-r--r--', 'size': 14, 'md5': 'a46776ca9d8e292b7cf4358c449d258b'},
-  }
+    }
 
-  MountZipAndCheckTree('deep.zip', want_tree, options=['-o', 'notrim'], want_blocks=69, want_inodes=1725, strict=False)
+    MountArchiveAndCheckTree('deep.zip',
+                         want_tree,
+                         options=['-o', 'notrim'],
+                         want_blocks=69,
+                         want_inodes=1725,
+                         strict=False)
+
 
 # Tests that a big file can be accessed in random order.
-def TestBigZip(options=[]):
-  zip_name = 'big.zip'
-  s = f'Test {zip_name!r}'
-  if options:
-    s += f', options = {" ".join(options)!r}'
-  logging.info(s)
-  with tempfile.TemporaryDirectory() as mount_point:
-    zip_path = os.path.join(script_dir, 'data', zip_name)
-    logging.debug(f'Mounting {zip_path!r} on {mount_point!r}...')
-    subprocess.run(
-        [mount_program, *options, '--', zip_path, mount_point],
-        check=True,
-        capture_output=True,
-        input='',
-        encoding='UTF-8',
-    )
-    try:
-      logging.debug(f'Mounted ZIP {zip_path!r} on {mount_point!r}')
-
-      GetTree(mount_point, use_md5=False)
-      st = os.statvfs(mount_point)
-
-      want_blocks = 10546877
-      if st.f_blocks != want_blocks:
-        LogError(
-            f'Mismatch for st.f_blocks: got: {st.f_blocks}, want: {want_blocks}'
+def TestBigArchive(options=[]):
+    zip_name = 'big.zip'
+    s = f'Test {zip_name!r}'
+    if options:
+        s += f', options = {" ".join(options)!r}'
+    logging.info(s)
+    with tempfile.TemporaryDirectory() as mount_point:
+        zip_path = os.path.join(script_dir, 'data', zip_name)
+        logging.debug(f'Mounting {zip_path!r} on {mount_point!r}...')
+        subprocess.run(
+            [mount_program, *options, '--', zip_path, mount_point],
+            check=True,
+            capture_output=True,
+            input='',
+            encoding='UTF-8',
         )
+        try:
+            logging.debug(f'Mounted ZIP {zip_path!r} on {mount_point!r}')
 
-      want_inodes = 2
-      if st.f_files != want_inodes:
-        LogError(
-            f'Mismatch for st.f_files: got: {st.f_files}, want: {want_inodes}'
-        )
+            GetTree(mount_point, use_md5=False)
+            st = os.statvfs(mount_point)
 
-      fd = os.open(os.path.join(mount_point, 'big.txt'), os.O_RDONLY)
-      try:
-        random.seed()
-        n = 100000000
-        for j in [random.randrange(n) for i in range(100)] + [n - 1, 0, n - 1]:
-          logging.debug(f'Getting line {j}...')
-          want_line = b'%08d The quick brown fox jumps over the lazy dog.\n' % j
-          got_line = os.pread(fd, len(want_line), j * len(want_line))
-          if got_line != want_line:
-            LogError(f'Want line: {want_line!r}, Got line: {got_line!r}')
-        got_line = os.pread(fd, 100, j * len(want_line))
-        if got_line != want_line:
-          LogError(f'Want line: {want_line!r}, Got line: {got_line!r}')
-        got_line = os.pread(fd, 100, n * len(want_line))
-        if got_line:
-          LogError(f'Want empty line, Got line: {got_line!r}')
-      finally:
-        os.close(fd)
-    finally:
-      logging.debug(f'Unmounting {zip_path!r} from {mount_point!r}...')
-      subprocess.run(['umount', '-l', mount_point], check=True)
-      logging.debug(f'Unmounted {zip_path!r} from {mount_point!r}')
+            want_blocks = 10546877
+            if st.f_blocks != want_blocks:
+                LogError(
+                    f'Mismatch for st.f_blocks: got: {st.f_blocks}, want: {want_blocks}'
+                )
+
+            want_inodes = 2
+            if st.f_files != want_inodes:
+                LogError(
+                    f'Mismatch for st.f_files: got: {st.f_files}, want: {want_inodes}'
+                )
+
+            fd = os.open(os.path.join(mount_point, 'big.txt'), os.O_RDONLY)
+            try:
+                random.seed()
+                n = 100000000
+                for j in [random.randrange(n)
+                          for i in range(100)] + [n - 1, 0, n - 1]:
+                    logging.debug(f'Getting line {j}...')
+                    want_line = b'%08d The quick brown fox jumps over the lazy dog.\n' % j
+                    got_line = os.pread(fd, len(want_line), j * len(want_line))
+                    if got_line != want_line:
+                        LogError(
+                            f'Want line: {want_line!r}, Got line: {got_line!r}'
+                        )
+                got_line = os.pread(fd, 100, j * len(want_line))
+                if got_line != want_line:
+                    LogError(
+                        f'Want line: {want_line!r}, Got line: {got_line!r}')
+                got_line = os.pread(fd, 100, n * len(want_line))
+                if got_line:
+                    LogError(f'Want empty line, Got line: {got_line!r}')
+            finally:
+                os.close(fd)
+        finally:
+            logging.debug(f'Unmounting {zip_path!r} from {mount_point!r}...')
+            subprocess.run(['umount', '-l', mount_point], check=True)
+            logging.debug(f'Unmounted {zip_path!r} from {mount_point!r}')
 
 
 # Tests that an archive with many nodes and deep hierarchies can be mounted.
 def TestManyNodes():
-  zip_name = 'many_nodes.zip'
-  logging.info(f'Test {zip_name!r}')
-  with tempfile.TemporaryDirectory() as mount_point:
-    zip_path = os.path.join(script_dir, 'data', zip_name)
-    logging.debug(f'Mounting {zip_path!r} on {mount_point!r}...')
-    subprocess.run(
-        [mount_program, '--', zip_path, mount_point],
-        check=True,
-        capture_output=True,
-        input='',
-        encoding='UTF-8',
-    )
-    try:
-      logging.debug(f'Mounted ZIP {zip_path!r} on {mount_point!r}')
-
-      # Check a few files.
-      for i, j in [(0, 0), (50, 50), (99, 99)]:
-        path = os.path.join(mount_point, '%02d' % i, '%02d' % j, *(['x'] * 2000))
-        want_content = b'File %02d/%02d\n' % (i, j)
-        with open(path, 'rb') as f:
-          got_content = f.read()
-          if got_content != want_content:
-            LogError(f'Want content: {want_content!r}, Got content: {got_content!r}')
-
-      st = os.statvfs(mount_point)
-      # total nodes = 1 (root) + 100 (i) + 100*100 (j) + 10,000 * 1999 (x dirs) + 10,000 (files)
-      # = 1 + 100 + 10,000 + 19,990,000 + 10,000 = 20,010,101
-      want_inodes = 20010101
-      if st.f_files != want_inodes:
-        LogError(
-            f'Mismatch for st.f_files: got: {st.f_files}, want: {want_inodes}'
+    zip_name = 'many_nodes.zip'
+    logging.info(f'Test {zip_name!r}')
+    with tempfile.TemporaryDirectory() as mount_point:
+        zip_path = os.path.join(script_dir, 'data', zip_name)
+        logging.debug(f'Mounting {zip_path!r} on {mount_point!r}...')
+        subprocess.run(
+            [mount_program, '--', zip_path, mount_point],
+            check=True,
+            capture_output=True,
+            input='',
+            encoding='UTF-8',
         )
+        try:
+            logging.debug(f'Mounted ZIP {zip_path!r} on {mount_point!r}')
 
-    finally:
-      logging.debug(f'Unmounting {zip_path!r} from {mount_point!r}...')
-      subprocess.run(['umount', '-l', mount_point], check=True)
-      logging.debug(f'Unmounted {zip_path!r} from {mount_point!r}')
+            # Check a few files.
+            for i, j in [(0, 0), (50, 50), (99, 99)]:
+                path = os.path.join(mount_point, '%02d' % i, '%02d' % j,
+                                    *(['x'] * 2000))
+                want_content = b'File %02d/%02d\n' % (i, j)
+                with open(path, 'rb') as f:
+                    got_content = f.read()
+                    if got_content != want_content:
+                        LogError(
+                            f'Want content: {want_content!r}, Got content: {got_content!r}'
+                        )
+
+            st = os.statvfs(mount_point)
+            # total nodes = 1 (root) + 100 (i) + 100*100 (j) + 10,000 * 1999 (x dirs) + 10,000 (files)
+            # = 1 + 100 + 10,000 + 19,990,000 + 10,000 = 20,010,101
+            want_inodes = 20010101
+            if st.f_files != want_inodes:
+                LogError(
+                    f'Mismatch for st.f_files: got: {st.f_files}, want: {want_inodes}'
+                )
+
+        finally:
+            logging.debug(f'Unmounting {zip_path!r} from {mount_point!r}...')
+            subprocess.run(['umount', '-l', mount_point], check=True)
+            logging.debug(f'Unmounted {zip_path!r} from {mount_point!r}')
 
 
 # Tests that a big file can be accessed in somewhat random order even with no
 # cache file.
-def TestBigZipNoCache(options=['-o', 'nocache']):
-  zip_name = 'big.zip'
-  s = f'Test {zip_name!r}'
-  if options:
-    s += f', options = {" ".join(options)!r}'
-  logging.info(s)
-  with tempfile.TemporaryDirectory() as mount_point:
-    zip_path = os.path.join(script_dir, 'data', zip_name)
-    logging.debug(f'Mounting {zip_path!r} on {mount_point!r}...')
-    subprocess.run(
-        [mount_program, *options, '--', zip_path, mount_point],
-        check=True,
-        capture_output=True,
-        input='',
-        encoding='UTF-8',
-    )
-    try:
-      logging.debug(f'Mounted ZIP {zip_path!r} on {mount_point!r}')
-      GetTree(mount_point, use_md5=False)
-      fd = os.open(os.path.join(mount_point, 'big.txt'), os.O_RDONLY)
-      try:
-        random.seed()
-        n = 100000000
-        for j in (
-            sorted([random.randrange(n) for i in range(50)])
-            + [n - 1, 0]
-            + sorted([random.randrange(n) for i in range(50)])
-            + [n - 1, 0]
-        ):
-          logging.debug(f'Getting line {j}...')
-          want_line = b'%08d The quick brown fox jumps over the lazy dog.\n' % j
-          got_line = os.pread(fd, len(want_line), j * len(want_line))
-          if got_line != want_line:
-            LogError(f'Want line: {want_line!r}, Got line: {got_line!r}')
-      finally:
-        os.close(fd)
-    finally:
-      logging.debug(f'Unmounting {zip_path!r} from {mount_point!r}...')
-      subprocess.run(['umount', '-l', mount_point], check=True)
-      logging.debug(f'Unmounted {zip_path!r} from {mount_point!r}')
+def TestBigArchiveNoCache(options=['-o', 'nocache']):
+    zip_name = 'big.zip'
+    s = f'Test {zip_name!r}'
+    if options:
+        s += f', options = {" ".join(options)!r}'
+    logging.info(s)
+    with tempfile.TemporaryDirectory() as mount_point:
+        zip_path = os.path.join(script_dir, 'data', zip_name)
+        logging.debug(f'Mounting {zip_path!r} on {mount_point!r}...')
+        subprocess.run(
+            [mount_program, *options, '--', zip_path, mount_point],
+            check=True,
+            capture_output=True,
+            input='',
+            encoding='UTF-8',
+        )
+        try:
+            logging.debug(f'Mounted ZIP {zip_path!r} on {mount_point!r}')
+            GetTree(mount_point, use_md5=False)
+            fd = os.open(os.path.join(mount_point, 'big.txt'), os.O_RDONLY)
+            try:
+                random.seed()
+                n = 100000000
+                for j in (sorted([random.randrange(n)
+                                  for i in range(50)]) + [n - 1, 0] +
+                          sorted([random.randrange(n)
+                                  for i in range(50)]) + [n - 1, 0]):
+                    logging.debug(f'Getting line {j}...')
+                    want_line = b'%08d The quick brown fox jumps over the lazy dog.\n' % j
+                    got_line = os.pread(fd, len(want_line), j * len(want_line))
+                    if got_line != want_line:
+                        LogError(
+                            f'Want line: {want_line!r}, Got line: {got_line!r}'
+                        )
+            finally:
+                os.close(fd)
+        finally:
+            logging.debug(f'Unmounting {zip_path!r} from {mount_point!r}...')
+            subprocess.run(['umount', '-l', mount_point], check=True)
+            logging.debug(f'Unmounted {zip_path!r} from {mount_point!r}')
 
 
 # Tests that a big file can be accessed in random order with memory cache.
-def TestBigZipMemCache():
-  TestBigZip(options=['-o', 'memcache'])
+def TestBigArchiveMemCache():
+    TestBigArchive(options=['-o', 'memcache'])
 
 
 # Tests encrypted ZIP.
-def TestEncryptedZip():
-  zip_name = 'different-encryptions.zip'
+def TestEncryptedArchive():
+    zip_name = 'different-encryptions.zip'
 
-  # With correct password.
-  want_tree = {
-      '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-      'Encrypted ZipCrypto.txt': {
-          'nlink': 1,
-          'mtime': 1598592187000000000,
-          'size': 34,
-          'md5': '275e8c5aed7e7ce2f32dd1e5e9ee4a5b',
-      },
-      'Encrypted AES-256.txt': {
-          'nlink': 1,
-          'mtime': 1598592213000000000,
-          'size': 32,
-          'md5': 'ca5e064a0835d186f2f6326f88a7078f',
-      },
-      'Encrypted AES-192.txt': {
-          'nlink': 1,
-          'mtime': 1598592206000000000,
-          'size': 32,
-          'md5': 'e48d57930ef96ff2ad45867202d3250d',
-      },
-      'Encrypted AES-128.txt': {
-          'nlink': 1,
-          'mtime': 1598592200000000000,
-          'size': 32,
-          'md5': '07c4edd2a55c9d5614457a21fb40aa56',
-      },
-      'ClearText.txt': {
-          'nlink': 1,
-          'mtime': 1598592138000000000,
-          'size': 23,
-          'md5': '7a542815e2c51837b3d8a8b2ebf36490',
-      },
-  }
+    # With correct password.
+    want_tree = {
+        '.': {
+            'ino': 1,
+            'mode': 'drwxr-xr-x',
+            'nlink': 2
+        },
+        'Encrypted ZipCrypto.txt': {
+            'nlink': 1,
+            'mtime': 1598592187000000000,
+            'size': 34,
+            'md5': '275e8c5aed7e7ce2f32dd1e5e9ee4a5b',
+        },
+        'Encrypted AES-256.txt': {
+            'nlink': 1,
+            'mtime': 1598592213000000000,
+            'size': 32,
+            'md5': 'ca5e064a0835d186f2f6326f88a7078f',
+        },
+        'Encrypted AES-192.txt': {
+            'nlink': 1,
+            'mtime': 1598592206000000000,
+            'size': 32,
+            'md5': 'e48d57930ef96ff2ad45867202d3250d',
+        },
+        'Encrypted AES-128.txt': {
+            'nlink': 1,
+            'mtime': 1598592200000000000,
+            'size': 32,
+            'md5': '07c4edd2a55c9d5614457a21fb40aa56',
+        },
+        'ClearText.txt': {
+            'nlink': 1,
+            'mtime': 1598592138000000000,
+            'size': 23,
+            'md5': '7a542815e2c51837b3d8a8b2ebf36490',
+        },
+    }
 
-  MountZipAndCheckTree(
-      zip_name, want_tree, want_blocks=11, want_inodes=6, password='password'
-  )
+    MountArchiveAndCheckTree(zip_name,
+                         want_tree,
+                         want_blocks=11,
+                         want_inodes=6,
+                         password='password')
 
-  MountZipAndCheckTree(
-      zip_name, want_tree, want_blocks=11, want_inodes=6, password='password\n'
-  )
+    MountArchiveAndCheckTree(zip_name,
+                         want_tree,
+                         want_blocks=11,
+                         want_inodes=6,
+                         password='password\n')
 
-  MountZipAndCheckTree(
-      zip_name,
-      want_tree,
-      want_blocks=11,
-      want_inodes=6,
-      password='password\nThis line is ignored...\n',
-  )
+    MountArchiveAndCheckTree(
+        zip_name,
+        want_tree,
+        want_blocks=11,
+        want_inodes=6,
+        password='password\nThis line is ignored...\n',
+    )
 
-  # With wrong or no password.
-  CheckZipMountingError(zip_name, 37, password='wrong password')
-  CheckZipMountingError(zip_name, 36)
+    # With wrong or no password.
+    CheckArchiveMountingError(zip_name, 37, password='wrong password')
+    CheckArchiveMountingError(zip_name, 36)
 
-  want_tree = {
-      '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-      'Encrypted ZipCrypto.txt': {
-          'nlink': 1,
-          'mtime': 1598592187000000000,
-          'size': 34,
-          'errno': 5,
-      },
-      'Encrypted AES-256.txt': {
-          'nlink': 1,
-          'mtime': 1598592213000000000,
-          'size': 32,
-          'errno': 5,
-      },
-      'Encrypted AES-192.txt': {
-          'nlink': 1,
-          'mtime': 1598592206000000000,
-          'size': 32,
-          'errno': 5,
-      },
-      'Encrypted AES-128.txt': {
-          'nlink': 1,
-          'mtime': 1598592200000000000,
-          'size': 32,
-          'errno': 5,
-      },
-      'ClearText.txt': {
-          'nlink': 1,
-          'mtime': 1598592138000000000,
-          'size': 23,
-          'md5': '7a542815e2c51837b3d8a8b2ebf36490',
-      },
-  }
+    want_tree = {
+        '.': {
+            'ino': 1,
+            'mode': 'drwxr-xr-x',
+            'nlink': 2
+        },
+        'Encrypted ZipCrypto.txt': {
+            'nlink': 1,
+            'mtime': 1598592187000000000,
+            'size': 34,
+            'errno': 5,
+        },
+        'Encrypted AES-256.txt': {
+            'nlink': 1,
+            'mtime': 1598592213000000000,
+            'size': 32,
+            'errno': 5,
+        },
+        'Encrypted AES-192.txt': {
+            'nlink': 1,
+            'mtime': 1598592206000000000,
+            'size': 32,
+            'errno': 5,
+        },
+        'Encrypted AES-128.txt': {
+            'nlink': 1,
+            'mtime': 1598592200000000000,
+            'size': 32,
+            'errno': 5,
+        },
+        'ClearText.txt': {
+            'nlink': 1,
+            'mtime': 1598592138000000000,
+            'size': 23,
+            'md5': '7a542815e2c51837b3d8a8b2ebf36490',
+        },
+    }
 
-  MountZipAndCheckTree(
-      zip_name,
-      want_tree,
-      want_blocks=11,
-      want_inodes=6,
-      password='wrong password',
-      options=['-o', 'force'],
-  )
+    MountArchiveAndCheckTree(
+        zip_name,
+        want_tree,
+        want_blocks=11,
+        want_inodes=6,
+        password='wrong password',
+        options=['-o', 'force'],
+    )
 
-  MountZipAndCheckTree(
-      zip_name,
-      want_tree,
-      want_blocks=11,
-      want_inodes=6,
-      options=['-o', 'force'],
-  )
+    MountArchiveAndCheckTree(
+        zip_name,
+        want_tree,
+        want_blocks=11,
+        want_inodes=6,
+        options=['-o', 'force'],
+    )
 
 
 # Tests mounting ZIP with explicit file name encoding.
-def TestZipFileNameEncoding():
-  want_tree = {
-      '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-      'Дата': {
-          'nlink': 1,
-          'size': 5,
-          'md5': 'a9564ebc3289b7a14551baf8ad5ec60a',
-      },
-      'Текстовый документ.txt': {
-          'nlink': 1,
-          'size': 8,
-          'md5': 'f75b8179e4bbe7e2b4a074dcef62de95',
-      },
-  }
-  MountZipAndCheckTree('cp866.zip', want_tree, options=['-o', 'encoding=cp866'])
+def TestArchiveFileNameEncoding():
+    want_tree = {
+        '.': {
+            'ino': 1,
+            'mode': 'drwxr-xr-x',
+            'nlink': 2
+        },
+        'Дата': {
+            'nlink': 1,
+            'size': 5,
+            'md5': 'a9564ebc3289b7a14551baf8ad5ec60a',
+        },
+        'Текстовый документ.txt': {
+            'nlink': 1,
+            'size': 8,
+            'md5': 'f75b8179e4bbe7e2b4a074dcef62de95',
+        },
+    }
 
-  want_tree = {
+    MountArchiveAndCheckTree('cp866.zip',
+                         want_tree,
+                         options=['-o', 'encoding=cp866'])
+
+    want_tree = {
       '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 3},
       '±≥≤⌠⌡÷≈°∙·√ⁿ²■\xa0\xa0': {'size': 0},
       'ßΓπΣσμτΦΘΩδ∞φε∩≡': {'size': 0},
@@ -2152,580 +2407,615 @@ def TestZipFileNameEncoding():
           'size': 0
       },
       '\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10': {'size': 0},
-  }
-  MountZipAndCheckTree('cp437.zip', want_tree, options=['-o', 'encoding=cp437'])
+    }
 
-  del want_tree['ßΓπΣσμτΦΘΩδ∞φε∩≡']
-  del want_tree['qrstuvwxyz{|}~\x1aÇ']
-  del want_tree['\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1c\x1b\x7f\x1d\x1e\x1f ']
-  del want_tree['\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10']
+    MountArchiveAndCheckTree('cp437.zip',
+                         want_tree,
+                         options=['-o', 'encoding=cp437'])
 
-  want_tree.update({
+    del want_tree['ßΓπΣσμτΦΘΩδ∞φε∩≡']
+    del want_tree['qrstuvwxyz{|}~\x1aÇ']
+    del want_tree[
+        '\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1c\x1b\x7f\x1d\x1e\x1f ']
+    del want_tree['\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10']
+
+    want_tree.update({
       'ßΓπΣσµτΦΘΩδ∞φε∩≡': {'size': 0},
       'qrstuvwxyz{|}~⌂Ç': {'size': 0},
       '◄↕‼¶§▬↨↑↓→←∟↔▲▼ ': {'size': 0},
       '☺☻♥♦♣♠•◘○◙♂♀♪♫☼►': {'size': 0},
-  })
-  MountZipAndCheckTree(
-      'cp437.zip', want_tree, options=['-o', 'encoding=libzip']
-  )
-  MountZipAndCheckTree('cp437.zip', want_tree, options=['-o', 'encoding=wrong'])
+    })
+
+    MountArchiveAndCheckTree('cp437.zip',
+                         want_tree,
+                         options=['-o', 'encoding=libzip'])
+    MountArchiveAndCheckTree('cp437.zip',
+                         want_tree,
+                         options=['-o', 'encoding=wrong'])
 
 
 # Tests the nosymlinks, nohardlinks and nospecials mount options.
-def TestZipWithSpecialFiles():
-  zip_name = 'pkware-specials.zip'
+def TestArchiveWithSpecialFiles():
+    zip_name = 'pkware-specials.zip'
 
-  want_tree = {
-      '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-      'z-hardlink2': {
-          'mode': '-rw-r--r--',
-          'nlink': 3,
-          'mtime': 1565290018000000000,
-          'size': 32,
-          'md5': '456e611a5420b7dd09bae143a7b2deb0',
-      },
-      'z-hardlink1': {
-          'mode': '-rw-r--r--',
-          'nlink': 3,
-          'mtime': 1565290018000000000,
-          'size': 32,
-          'md5': '456e611a5420b7dd09bae143a7b2deb0',
-      },
-      'z-hardlink-symlink': {
-          'mode': 'lrwxrwxrwx',
-          'nlink': 1,
-          'mtime': 1564834729000000000,
-          'target': 'regular',
-      },
-      'symlink': {
-          'mode': 'lrwxrwxrwx',
-          'nlink': 1,
-          'mtime': 1564834729000000000,
-          'target': 'regular',
-      },
-      'z-hardlink-socket': {
-          'mode': 'srw-r--r--',
-          'nlink': 1,
-          'mtime': 1564834444000000000,
-      },
-      'z-hardlink-fifo': {
-          'mode': 'prw-r--r--',
-          'nlink': 1,
-          'mtime': 1565809123000000000,
-      },
-      'z-hardlink-char': {
-          'mode': 'crw-r--r--',
-          'nlink': 1,
-          'mtime': 1564833480000000000,
-          'rdev': 1024,
-      },
-      'z-hardlink-block': {
-          'mode': 'brw-r--r--',
-          'nlink': 1,
-          'mtime': 1564833480000000000,
-          'rdev': 2049,
-      },
-      'symlink2': {
-          'mode': 'lrwxrwxrwx',
-          'nlink': 1,
-          'mtime': 1566731354000000000,
-          'target': 'regular',
-      },
-      'socket': {
-          'mode': 'srw-r--r--',
-          'nlink': 1,
-          'mtime': 1564834444000000000,
-      },
-      'regular': {
-          'mode': '-rw-r--r--',
-          'nlink': 3,
-          'mtime': 1565290018000000000,
-          'size': 32,
-          'md5': '456e611a5420b7dd09bae143a7b2deb0',
-      },
-      'fifo': {
-          'mode': 'prw-r--r--',
-          'nlink': 1,
-          'mtime': 1565809123000000000,
-      },
-      'char': {
-          'mode': 'crw-r--r--',
-          'nlink': 1,
-          'mtime': 1564833480000000000,
-          'rdev': 1024,
-      },
-      'block': {
-          'mode': 'brw-r--r--',
-          'nlink': 1,
-          'mtime': 1564833480000000000,
-          'rdev': 2049,
-      },
-  }
+    want_tree = {
+        '.': {
+            'ino': 1,
+            'mode': 'drwxr-xr-x',
+            'nlink': 2
+        },
+        'z-hardlink2': {
+            'mode': '-rw-r--r--',
+            'nlink': 3,
+            'mtime': 1565290018000000000,
+            'size': 32,
+            'md5': '456e611a5420b7dd09bae143a7b2deb0',
+        },
+        'z-hardlink1': {
+            'mode': '-rw-r--r--',
+            'nlink': 3,
+            'mtime': 1565290018000000000,
+            'size': 32,
+            'md5': '456e611a5420b7dd09bae143a7b2deb0',
+        },
+        'z-hardlink-symlink': {
+            'mode': 'lrwxrwxrwx',
+            'nlink': 1,
+            'mtime': 1564834729000000000,
+            'target': 'regular',
+        },
+        'symlink': {
+            'mode': 'lrwxrwxrwx',
+            'nlink': 1,
+            'mtime': 1564834729000000000,
+            'target': 'regular',
+        },
+        'z-hardlink-socket': {
+            'mode': 'srw-r--r--',
+            'nlink': 1,
+            'mtime': 1564834444000000000,
+        },
+        'z-hardlink-fifo': {
+            'mode': 'prw-r--r--',
+            'nlink': 1,
+            'mtime': 1565809123000000000,
+        },
+        'z-hardlink-char': {
+            'mode': 'crw-r--r--',
+            'nlink': 1,
+            'mtime': 1564833480000000000,
+            'rdev': 1024,
+        },
+        'z-hardlink-block': {
+            'mode': 'brw-r--r--',
+            'nlink': 1,
+            'mtime': 1564833480000000000,
+            'rdev': 2049,
+        },
+        'symlink2': {
+            'mode': 'lrwxrwxrwx',
+            'nlink': 1,
+            'mtime': 1566731354000000000,
+            'target': 'regular',
+        },
+        'socket': {
+            'mode': 'srw-r--r--',
+            'nlink': 1,
+            'mtime': 1564834444000000000,
+        },
+        'regular': {
+            'mode': '-rw-r--r--',
+            'nlink': 3,
+            'mtime': 1565290018000000000,
+            'size': 32,
+            'md5': '456e611a5420b7dd09bae143a7b2deb0',
+        },
+        'fifo': {
+            'mode': 'prw-r--r--',
+            'nlink': 1,
+            'mtime': 1565809123000000000,
+        },
+        'char': {
+            'mode': 'crw-r--r--',
+            'nlink': 1,
+            'mtime': 1564833480000000000,
+            'rdev': 1024,
+        },
+        'block': {
+            'mode': 'brw-r--r--',
+            'nlink': 1,
+            'mtime': 1564833480000000000,
+            'rdev': 2049,
+        },
+    }
 
-  MountZipAndCheckTree(zip_name, want_tree, want_blocks=19, want_inodes=15)
+    MountArchiveAndCheckTree(zip_name, want_tree, want_blocks=19, want_inodes=15)
 
-  # Check that the inode numbers of hardlinks match
-  got_tree, _ = MountZipAndGetTree(zip_name)
-  want_ino = got_tree['regular']['ino']
-  if not want_ino > 0:
-    LogError(f'Want positive ino, Got: {want_ino}')
+    # Check that the inode numbers of hardlinks match
+    got_tree, _ = MountArchiveAndGetTree(zip_name)
+    want_ino = got_tree['regular']['ino']
+    if not want_ino > 0:
+        LogError(f'Want positive ino, Got: {want_ino}')
 
-  for link_name in ['z-hardlink1', 'z-hardlink2']:
-    got_ino = got_tree[link_name]['ino']
-    if got_ino != want_ino:
-      LogError(f'Want ino: {want_ino}, Got: {got_ino}')
+    for link_name in ['z-hardlink1', 'z-hardlink2']:
+        got_ino = got_tree[link_name]['ino']
+        if got_ino != want_ino:
+            LogError(f'Want ino: {want_ino}, Got: {got_ino}')
 
-  # Test -o nosymlinks
-  want_tree = {
-      '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-      'z-hardlink2': {
-          'mode': '-rw-r--r--',
-          'nlink': 3,
-          'mtime': 1565290018000000000,
-          'size': 32,
-          'md5': '456e611a5420b7dd09bae143a7b2deb0',
-      },
-      'z-hardlink1': {
-          'mode': '-rw-r--r--',
-          'nlink': 3,
-          'mtime': 1565290018000000000,
-          'size': 32,
-          'md5': '456e611a5420b7dd09bae143a7b2deb0',
-      },
-      'z-hardlink-socket': {
-          'mode': 'srw-r--r--',
-          'nlink': 1,
-          'mtime': 1564834444000000000,
-      },
-      'z-hardlink-fifo': {
-          'mode': 'prw-r--r--',
-          'nlink': 1,
-          'mtime': 1565809123000000000,
-      },
-      'z-hardlink-char': {
-          'mode': 'crw-r--r--',
-          'nlink': 1,
-          'mtime': 1564833480000000000,
-          'rdev': 1024,
-      },
-      'z-hardlink-block': {
-          'mode': 'brw-r--r--',
-          'nlink': 1,
-          'mtime': 1564833480000000000,
-          'rdev': 2049,
-      },
-      'socket': {
-          'mode': 'srw-r--r--',
-          'nlink': 1,
-          'mtime': 1564834444000000000,
-      },
-      'regular': {
-          'mode': '-rw-r--r--',
-          'nlink': 3,
-          'mtime': 1565290018000000000,
-          'size': 32,
-          'md5': '456e611a5420b7dd09bae143a7b2deb0',
-      },
-      'fifo': {
-          'mode': 'prw-r--r--',
-          'nlink': 1,
-          'mtime': 1565809123000000000,
-      },
-      'char': {
-          'mode': 'crw-r--r--',
-          'nlink': 1,
-          'mtime': 1564833480000000000,
-          'rdev': 1024,
-      },
-      'block': {
-          'mode': 'brw-r--r--',
-          'nlink': 1,
-          'mtime': 1564833480000000000,
-          'rdev': 2049,
-      },
-  }
+    # Test -o nosymlinks
+    want_tree = {
+        '.': {
+            'ino': 1,
+            'mode': 'drwxr-xr-x',
+            'nlink': 2
+        },
+        'z-hardlink2': {
+            'mode': '-rw-r--r--',
+            'nlink': 3,
+            'mtime': 1565290018000000000,
+            'size': 32,
+            'md5': '456e611a5420b7dd09bae143a7b2deb0',
+        },
+        'z-hardlink1': {
+            'mode': '-rw-r--r--',
+            'nlink': 3,
+            'mtime': 1565290018000000000,
+            'size': 32,
+            'md5': '456e611a5420b7dd09bae143a7b2deb0',
+        },
+        'z-hardlink-socket': {
+            'mode': 'srw-r--r--',
+            'nlink': 1,
+            'mtime': 1564834444000000000,
+        },
+        'z-hardlink-fifo': {
+            'mode': 'prw-r--r--',
+            'nlink': 1,
+            'mtime': 1565809123000000000,
+        },
+        'z-hardlink-char': {
+            'mode': 'crw-r--r--',
+            'nlink': 1,
+            'mtime': 1564833480000000000,
+            'rdev': 1024,
+        },
+        'z-hardlink-block': {
+            'mode': 'brw-r--r--',
+            'nlink': 1,
+            'mtime': 1564833480000000000,
+            'rdev': 2049,
+        },
+        'socket': {
+            'mode': 'srw-r--r--',
+            'nlink': 1,
+            'mtime': 1564834444000000000,
+        },
+        'regular': {
+            'mode': '-rw-r--r--',
+            'nlink': 3,
+            'mtime': 1565290018000000000,
+            'size': 32,
+            'md5': '456e611a5420b7dd09bae143a7b2deb0',
+        },
+        'fifo': {
+            'mode': 'prw-r--r--',
+            'nlink': 1,
+            'mtime': 1565809123000000000,
+        },
+        'char': {
+            'mode': 'crw-r--r--',
+            'nlink': 1,
+            'mtime': 1564833480000000000,
+            'rdev': 1024,
+        },
+        'block': {
+            'mode': 'brw-r--r--',
+            'nlink': 1,
+            'mtime': 1564833480000000000,
+            'rdev': 2049,
+        },
+    }
 
-  MountZipAndCheckTree(
-      zip_name,
-      want_tree,
-      want_blocks=13,
-      want_inodes=12,
-      options=['-o', 'nosymlinks'],
-  )
+    MountArchiveAndCheckTree(
+        zip_name,
+        want_tree,
+        want_blocks=13,
+        want_inodes=12,
+        options=['-o', 'nosymlinks'],
+    )
 
-  # Test -o nohardlinks
-  want_tree = {
-      '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-      'z-hardlink-socket': {
-          'mode': 'srw-r--r--',
-          'nlink': 1,
-          'mtime': 1564834444000000000,
-      },
-      'z-hardlink-fifo': {
-          'mode': 'prw-r--r--',
-          'nlink': 1,
-          'mtime': 1565809123000000000,
-      },
-      'z-hardlink-char': {
-          'mode': 'crw-r--r--',
-          'nlink': 1,
-          'mtime': 1564833480000000000,
-          'rdev': 1024,
-      },
-      'z-hardlink-block': {
-          'mode': 'brw-r--r--',
-          'nlink': 1,
-          'mtime': 1564833480000000000,
-          'rdev': 2049,
-      },
-      'symlink2': {
-          'mode': 'lrwxrwxrwx',
-          'nlink': 1,
-          'mtime': 1566731354000000000,
-          'target': 'regular',
-      },
-      'socket': {
-          'mode': 'srw-r--r--',
-          'nlink': 1,
-          'mtime': 1564834444000000000,
-      },
-      'regular': {
-          'mode': '-rw-r--r--',
-          'nlink': 1,
-          'mtime': 1565290018000000000,
-          'size': 32,
-          'md5': '456e611a5420b7dd09bae143a7b2deb0',
-      },
-      'fifo': {
-          'mode': 'prw-r--r--',
-          'nlink': 1,
-          'mtime': 1565809123000000000,
-      },
-      'char': {
-          'mode': 'crw-r--r--',
-          'nlink': 1,
-          'mtime': 1564833480000000000,
-          'rdev': 1024,
-      },
-      'block': {
-          'mode': 'brw-r--r--',
-          'nlink': 1,
-          'mtime': 1564833480000000000,
-          'rdev': 2049,
-      },
-  }
+    # Test -o nohardlinks
+    want_tree = {
+        '.': {
+            'ino': 1,
+            'mode': 'drwxr-xr-x',
+            'nlink': 2
+        },
+        'z-hardlink-socket': {
+            'mode': 'srw-r--r--',
+            'nlink': 1,
+            'mtime': 1564834444000000000,
+        },
+        'z-hardlink-fifo': {
+            'mode': 'prw-r--r--',
+            'nlink': 1,
+            'mtime': 1565809123000000000,
+        },
+        'z-hardlink-char': {
+            'mode': 'crw-r--r--',
+            'nlink': 1,
+            'mtime': 1564833480000000000,
+            'rdev': 1024,
+        },
+        'z-hardlink-block': {
+            'mode': 'brw-r--r--',
+            'nlink': 1,
+            'mtime': 1564833480000000000,
+            'rdev': 2049,
+        },
+        'symlink2': {
+            'mode': 'lrwxrwxrwx',
+            'nlink': 1,
+            'mtime': 1566731354000000000,
+            'target': 'regular',
+        },
+        'socket': {
+            'mode': 'srw-r--r--',
+            'nlink': 1,
+            'mtime': 1564834444000000000,
+        },
+        'regular': {
+            'mode': '-rw-r--r--',
+            'nlink': 1,
+            'mtime': 1565290018000000000,
+            'size': 32,
+            'md5': '456e611a5420b7dd09bae143a7b2deb0',
+        },
+        'fifo': {
+            'mode': 'prw-r--r--',
+            'nlink': 1,
+            'mtime': 1565809123000000000,
+        },
+        'char': {
+            'mode': 'crw-r--r--',
+            'nlink': 1,
+            'mtime': 1564833480000000000,
+            'rdev': 1024,
+        },
+        'block': {
+            'mode': 'brw-r--r--',
+            'nlink': 1,
+            'mtime': 1564833480000000000,
+            'rdev': 2049,
+        },
+    }
 
-  MountZipAndCheckTree(
-      zip_name,
-      want_tree,
-      want_blocks=13,
-      want_inodes=11,
-      options=['-o', 'nohardlinks'],
-  )
+    MountArchiveAndCheckTree(
+        zip_name,
+        want_tree,
+        want_blocks=13,
+        want_inodes=11,
+        options=['-o', 'nohardlinks'],
+    )
 
-  # Test -o nospecials
-  want_tree = {
-      '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-      'z-hardlink2': {
-          'mode': '-rw-r--r--',
-          'nlink': 3,
-          'mtime': 1565290018000000000,
-          'size': 32,
-          'md5': '456e611a5420b7dd09bae143a7b2deb0',
-      },
-      'z-hardlink1': {
-          'mode': '-rw-r--r--',
-          'nlink': 3,
-          'mtime': 1565290018000000000,
-          'size': 32,
-          'md5': '456e611a5420b7dd09bae143a7b2deb0',
-      },
-      'z-hardlink-symlink': {
-          'mode': 'lrwxrwxrwx',
-          'nlink': 1,
-          'mtime': 1564834729000000000,
-          'target': 'regular',
-      },
-      'symlink': {
-          'mode': 'lrwxrwxrwx',
-          'nlink': 1,
-          'mtime': 1564834729000000000,
-          'target': 'regular',
-      },
-      'symlink2': {
-          'mode': 'lrwxrwxrwx',
-          'nlink': 1,
-          'mtime': 1566731354000000000,
-          'target': 'regular',
-      },
-      'regular': {
-          'mode': '-rw-r--r--',
-          'nlink': 3,
-          'mtime': 1565290018000000000,
-          'size': 32,
-          'md5': '456e611a5420b7dd09bae143a7b2deb0',
-      },
-  }
+    # Test -o nospecials
+    want_tree = {
+        '.': {
+            'ino': 1,
+            'mode': 'drwxr-xr-x',
+            'nlink': 2
+        },
+        'z-hardlink2': {
+            'mode': '-rw-r--r--',
+            'nlink': 3,
+            'mtime': 1565290018000000000,
+            'size': 32,
+            'md5': '456e611a5420b7dd09bae143a7b2deb0',
+        },
+        'z-hardlink1': {
+            'mode': '-rw-r--r--',
+            'nlink': 3,
+            'mtime': 1565290018000000000,
+            'size': 32,
+            'md5': '456e611a5420b7dd09bae143a7b2deb0',
+        },
+        'z-hardlink-symlink': {
+            'mode': 'lrwxrwxrwx',
+            'nlink': 1,
+            'mtime': 1564834729000000000,
+            'target': 'regular',
+        },
+        'symlink': {
+            'mode': 'lrwxrwxrwx',
+            'nlink': 1,
+            'mtime': 1564834729000000000,
+            'target': 'regular',
+        },
+        'symlink2': {
+            'mode': 'lrwxrwxrwx',
+            'nlink': 1,
+            'mtime': 1566731354000000000,
+            'target': 'regular',
+        },
+        'regular': {
+            'mode': '-rw-r--r--',
+            'nlink': 3,
+            'mtime': 1565290018000000000,
+            'size': 32,
+            'md5': '456e611a5420b7dd09bae143a7b2deb0',
+        },
+    }
 
-  MountZipAndCheckTree(
-      zip_name,
-      want_tree,
-      want_blocks=11,
-      want_inodes=7,
-      options=['-o', 'nospecials'],
-  )
+    MountArchiveAndCheckTree(
+        zip_name,
+        want_tree,
+        want_blocks=11,
+        want_inodes=7,
+        options=['-o', 'nospecials'],
+    )
 
-  # Tests -o nosymlinks nohardlinks and nospecials together
-  want_tree = {
-      '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-      'regular': {
-          'mode': '-rw-r--r--',
-          'nlink': 1,
-          'mtime': 1565290018000000000,
-          'size': 32,
-          'md5': '456e611a5420b7dd09bae143a7b2deb0',
-      },
-  }
+    # Tests -o nosymlinks nohardlinks and nospecials together
+    want_tree = {
+        '.': {
+            'ino': 1,
+            'mode': 'drwxr-xr-x',
+            'nlink': 2
+        },
+        'regular': {
+            'mode': '-rw-r--r--',
+            'nlink': 1,
+            'mtime': 1565290018000000000,
+            'size': 32,
+            'md5': '456e611a5420b7dd09bae143a7b2deb0',
+        },
+    }
 
-  MountZipAndCheckTree(
-      zip_name,
-      want_tree,
-      want_blocks=3,
-      want_inodes=2,
-      options=['-o', 'nosymlinks,nohardlinks,nospecials'],
-  )
+    MountArchiveAndCheckTree(
+        zip_name,
+        want_tree,
+        want_blocks=3,
+        want_inodes=2,
+        options=['-o', 'nosymlinks,nohardlinks,nospecials'],
+    )
 
-  # Tests -o default_permissions
-  want_tree = {
-      '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-      'z-hardlink2': {
-          'mode': '-rw-r--r--',
-          'uid': 1000,
-          'gid': 1000,
-          'nlink': 3,
-          'size': 32,
-          'md5': '456e611a5420b7dd09bae143a7b2deb0',
-      },
-      'z-hardlink1': {
-          'mode': '-rw-r--r--',
-          'uid': 1000,
-          'gid': 1000,
-          'nlink': 3,
-          'size': 32,
-          'md5': '456e611a5420b7dd09bae143a7b2deb0',
-      },
-      'z-hardlink-symlink': {
-          'mode': 'lrwxrwxrwx',
-          'uid': 1000,
-          'gid': 1000,
-          'target': 'regular',
-      },
-      'symlink': {
-          'mode': 'lrwxrwxrwx',
-          'uid': 1000,
-          'gid': 1000,
-          'target': 'regular',
-      },
-      'z-hardlink-socket': {
-          'mode': 'srw-------',
-          'uid': 1000,
-          'gid': 1000,
-      },
-      'z-hardlink-fifo': {
-          'mode': 'prw-r--r--',
-          'uid': 1000,
-          'gid': 1000,
-      },
-      'z-hardlink-char': {
-          'mode': 'crw-------',
-          'uid': 0,
-          'gid': 5,
-          'rdev': 1024,
-      },
-      'z-hardlink-block': {
-          'mode': 'brw-r-----',
-          'uid': 0,
-          'gid': 6,
-          'rdev': 2049,
-      },
-      'symlink2': {
-          'mode': 'lrwxrwxrwx',
-          'target': 'regular',
-          'uid': 1000,
-          'gid': 1000,
-      },
-      'socket': {
-          'mode': 'srw-------',
-          'uid': 1000,
-          'gid': 1000,
-      },
-      'regular': {
-          'mode': '-rw-r--r--',
-          'uid': 1000,
-          'gid': 1000,
-          'nlink': 3,
-          'size': 32,
-          'md5': '456e611a5420b7dd09bae143a7b2deb0',
-      },
-      'fifo': {
-          'mode': 'prw-r--r--',
-          'uid': 1000,
-          'gid': 1000,
-      },
-      'char': {
-          'mode': 'crw-------',
-          'uid': 0,
-          'gid': 5,
-          'rdev': 1024,
-      },
-      'block': {
-          'mode': 'brw-r-----',
-          'uid': 0,
-          'gid': 6,
-          'rdev': 2049,
-      },
-  }
+    # Tests -o default_permissions
+    want_tree = {
+        '.': {
+            'ino': 1,
+            'mode': 'drwxr-xr-x',
+            'nlink': 2
+        },
+        'z-hardlink2': {
+            'mode': '-rw-r--r--',
+            'uid': 1000,
+            'gid': 1000,
+            'nlink': 3,
+            'size': 32,
+            'md5': '456e611a5420b7dd09bae143a7b2deb0',
+        },
+        'z-hardlink1': {
+            'mode': '-rw-r--r--',
+            'uid': 1000,
+            'gid': 1000,
+            'nlink': 3,
+            'size': 32,
+            'md5': '456e611a5420b7dd09bae143a7b2deb0',
+        },
+        'z-hardlink-symlink': {
+            'mode': 'lrwxrwxrwx',
+            'uid': 1000,
+            'gid': 1000,
+            'target': 'regular',
+        },
+        'symlink': {
+            'mode': 'lrwxrwxrwx',
+            'uid': 1000,
+            'gid': 1000,
+            'target': 'regular',
+        },
+        'z-hardlink-socket': {
+            'mode': 'srw-------',
+            'uid': 1000,
+            'gid': 1000,
+        },
+        'z-hardlink-fifo': {
+            'mode': 'prw-r--r--',
+            'uid': 1000,
+            'gid': 1000,
+        },
+        'z-hardlink-char': {
+            'mode': 'crw-------',
+            'uid': 0,
+            'gid': 5,
+            'rdev': 1024,
+        },
+        'z-hardlink-block': {
+            'mode': 'brw-r-----',
+            'uid': 0,
+            'gid': 6,
+            'rdev': 2049,
+        },
+        'symlink2': {
+            'mode': 'lrwxrwxrwx',
+            'target': 'regular',
+            'uid': 1000,
+            'gid': 1000,
+        },
+        'socket': {
+            'mode': 'srw-------',
+            'uid': 1000,
+            'gid': 1000,
+        },
+        'regular': {
+            'mode': '-rw-r--r--',
+            'uid': 1000,
+            'gid': 1000,
+            'nlink': 3,
+            'size': 32,
+            'md5': '456e611a5420b7dd09bae143a7b2deb0',
+        },
+        'fifo': {
+            'mode': 'prw-r--r--',
+            'uid': 1000,
+            'gid': 1000,
+        },
+        'char': {
+            'mode': 'crw-------',
+            'uid': 0,
+            'gid': 5,
+            'rdev': 1024,
+        },
+        'block': {
+            'mode': 'brw-r-----',
+            'uid': 0,
+            'gid': 6,
+            'rdev': 2049,
+        },
+    }
 
-  MountZipAndCheckTree(
-      zip_name,
-      want_tree,
-      want_blocks=19,
-      want_inodes=15,
-      options=['-o', 'default_permissions'],
-  )
+    MountArchiveAndCheckTree(
+        zip_name,
+        want_tree,
+        want_blocks=19,
+        want_inodes=15,
+        options=['-o', 'default_permissions'],
+    )
 
-  # Tests -o default_permissions,fmask=0
-  want_tree = {
-      '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 2},
-      'z-hardlink2': {
-          'mode': '-rw-r--r--',
-          'uid': 1000,
-          'gid': 1000,
-          'nlink': 3,
-          'size': 32,
-          'md5': '456e611a5420b7dd09bae143a7b2deb0',
-      },
-      'z-hardlink1': {
-          'mode': '-rw-r--r--',
-          'uid': 1000,
-          'gid': 1000,
-          'nlink': 3,
-          'size': 32,
-          'md5': '456e611a5420b7dd09bae143a7b2deb0',
-      },
-      'z-hardlink-symlink': {
-          'mode': 'lrwxrwxrwx',
-          'uid': 1000,
-          'gid': 1000,
-          'target': 'regular',
-      },
-      'symlink': {
-          'mode': 'lrwxrwxrwx',
-          'uid': 1000,
-          'gid': 1000,
-          'target': 'regular',
-      },
-      'z-hardlink-socket': {
-          'mode': 'srw-------',
-          'uid': 1000,
-          'gid': 1000,
-      },
-      'z-hardlink-fifo': {
-          'mode': 'prw-r--r--',
-          'uid': 1000,
-          'gid': 1000,
-      },
-      'z-hardlink-char': {
-          'mode': 'crw--w----',
-          'uid': 0,
-          'gid': 5,
-          'rdev': 1024,
-      },
-      'z-hardlink-block': {
-          'mode': 'brw-rw----',
-          'uid': 0,
-          'gid': 6,
-          'rdev': 2049,
-      },
-      'symlink2': {
-          'mode': 'lrwxrwxrwx',
-          'target': 'regular',
-          'uid': 1000,
-          'gid': 1000,
-      },
-      'socket': {
-          'mode': 'srw-------',
-          'uid': 1000,
-          'gid': 1000,
-      },
-      'regular': {
-          'mode': '-rw-r--r--',
-          'uid': 1000,
-          'gid': 1000,
-          'nlink': 3,
-          'size': 32,
-          'md5': '456e611a5420b7dd09bae143a7b2deb0',
-      },
-      'fifo': {
-          'mode': 'prw-r--r--',
-          'uid': 1000,
-          'gid': 1000,
-      },
-      'char': {
-          'mode': 'crw--w----',
-          'uid': 0,
-          'gid': 5,
-          'rdev': 1024,
-      },
-      'block': {
-          'mode': 'brw-rw----',
-          'uid': 0,
-          'gid': 6,
-          'rdev': 2049,
-      },
-  }
+    # Tests -o default_permissions,fmask=0
+    want_tree = {
+        '.': {
+            'ino': 1,
+            'mode': 'drwxr-xr-x',
+            'nlink': 2
+        },
+        'z-hardlink2': {
+            'mode': '-rw-r--r--',
+            'uid': 1000,
+            'gid': 1000,
+            'nlink': 3,
+            'size': 32,
+            'md5': '456e611a5420b7dd09bae143a7b2deb0',
+        },
+        'z-hardlink1': {
+            'mode': '-rw-r--r--',
+            'uid': 1000,
+            'gid': 1000,
+            'nlink': 3,
+            'size': 32,
+            'md5': '456e611a5420b7dd09bae143a7b2deb0',
+        },
+        'z-hardlink-symlink': {
+            'mode': 'lrwxrwxrwx',
+            'uid': 1000,
+            'gid': 1000,
+            'target': 'regular',
+        },
+        'symlink': {
+            'mode': 'lrwxrwxrwx',
+            'uid': 1000,
+            'gid': 1000,
+            'target': 'regular',
+        },
+        'z-hardlink-socket': {
+            'mode': 'srw-------',
+            'uid': 1000,
+            'gid': 1000,
+        },
+        'z-hardlink-fifo': {
+            'mode': 'prw-r--r--',
+            'uid': 1000,
+            'gid': 1000,
+        },
+        'z-hardlink-char': {
+            'mode': 'crw--w----',
+            'uid': 0,
+            'gid': 5,
+            'rdev': 1024,
+        },
+        'z-hardlink-block': {
+            'mode': 'brw-rw----',
+            'uid': 0,
+            'gid': 6,
+            'rdev': 2049,
+        },
+        'symlink2': {
+            'mode': 'lrwxrwxrwx',
+            'target': 'regular',
+            'uid': 1000,
+            'gid': 1000,
+        },
+        'socket': {
+            'mode': 'srw-------',
+            'uid': 1000,
+            'gid': 1000,
+        },
+        'regular': {
+            'mode': '-rw-r--r--',
+            'uid': 1000,
+            'gid': 1000,
+            'nlink': 3,
+            'size': 32,
+            'md5': '456e611a5420b7dd09bae143a7b2deb0',
+        },
+        'fifo': {
+            'mode': 'prw-r--r--',
+            'uid': 1000,
+            'gid': 1000,
+        },
+        'char': {
+            'mode': 'crw--w----',
+            'uid': 0,
+            'gid': 5,
+            'rdev': 1024,
+        },
+        'block': {
+            'mode': 'brw-rw----',
+            'uid': 0,
+            'gid': 6,
+            'rdev': 2049,
+        },
+    }
 
-  MountZipAndCheckTree(
-      zip_name,
-      want_tree,
-      want_blocks=19,
-      want_inodes=15,
-      options=['-o', 'default_permissions,fmask=0'],
-  )
+    MountArchiveAndCheckTree(
+        zip_name,
+        want_tree,
+        want_blocks=19,
+        want_inodes=15,
+        options=['-o', 'default_permissions,fmask=0'],
+    )
 
 
 # Tests invalid and absent ZIP archives.
-def TestInvalidZip():
-  CheckZipMountingError('', 38)
-  CheckZipMountingError('absent.zip', 19)
-  CheckZipMountingError('invalid.zip', 29)
-  with tempfile.NamedTemporaryFile() as f:
-    os.chmod(f.name, 0)
-    CheckZipMountingError(f.name, 21 if os.getuid() != 0 else 29)
+def TestInvalidArchive():
+    CheckArchiveMountingError('', 38)
+    CheckArchiveMountingError('absent.zip', 19)
+    CheckArchiveMountingError('invalid.zip', 29)
+    with tempfile.NamedTemporaryFile() as f:
+        os.chmod(f.name, 0)
+        CheckArchiveMountingError(f.name, 21 if os.getuid() != 0 else 29)
 
 
 logging.getLogger().setLevel('INFO')
 
-TestZipWithDefaultOptions()
-TestZipFileNameEncoding()
-TestZipWithSpecialFiles()
-TestEncryptedZip()
-TestInvalidZip()
+TestArchiveWithDefaultOptions()
+TestArchiveFileNameEncoding()
+TestArchiveWithSpecialFiles()
+TestEncryptedArchive()
+TestInvalidArchive()
 TestMasks()
 TestMultiple()
 
-if '--fast' not in sys.argv:
-  TestDirectories()
-  TestZipWithManyFiles()
-  TestBigZip()
-  TestBigZip(options=['-o', 'precache'])
-  TestBigZipNoCache()
-  TestBigZipMemCache()
-  TestManyNodes()
+if not is_fast:
+    TestDirectories()
+    TestArchiveWithManyFiles()
+    TestBigArchive()
+    TestBigArchive(options=['-o', 'precache'])
+    TestBigArchiveNoCache()
+    TestBigArchiveMemCache()
+    TestManyNodes()
 
 if error_count:
-  LogError(f'FAIL: There were {error_count} errors')
-  sys.exit(1)
+    LogError(f'FAIL: There were {error_count} errors')
+    sys.exit(1)
 else:
-  logging.info('PASS: All tests passed')
+    logging.info('PASS: All tests passed')
