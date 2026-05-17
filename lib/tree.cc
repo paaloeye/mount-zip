@@ -410,11 +410,8 @@ void Tree::RehashIfNecessary() {
 
 Tree::Tree(std::span<const std::string> paths, Options opts)
     : Tree(OpenZips(paths), std::move(opts)) {
-  // Register root node.
   assert(root_);
-  assert(!root_->parent);
-  [[maybe_unused]] bool const ok = nodes_by_path_.insert(*root_).second;
-  assert(ok);
+  assert(root_->IsRoot());
 
   // Sum of all uncompressed file sizes.
   i64 total_uncompressed_size = 0;
@@ -516,11 +513,12 @@ Tree::Tree(std::span<const std::string> paths, Options opts)
       Node::Ptr archive_node(new Node{
           .parent = root_,
           .name = std::string(Path(zip_path).Split().second.WithoutExtension()),
-          .mode = S_IFDIR | 0777,
+          .mode = mode_t(S_IFDIR | 0777),
           .nlink = 2});
       Node* const node = RenameIfCollision(std::move(archive_node));
+      assert(node->IsDir());
       root_->AddChild(node);
-      root_->nlink++;
+      total_block_count_++;
       path += node->name;
     }
 
@@ -559,10 +557,14 @@ Tree::Tree(std::span<const std::string> paths, Options opts)
         Node* const node = GetOrCreateDirNode(path);
         assert(node);
         assert(!node->hardlink_target);
-        Node::Init(*node, z, id, mode);
-        total_block_count_ += 1;
+        assert(node->IsDir());
+        node->zip = z;
+        node->id = id;
+        node->mode = mode;
+        node->Init();
         assert(total_uncompressed_size >= size);
         total_uncompressed_size -= size;
+        assert(node->IsDir());
         continue;
       }
 
@@ -587,16 +589,17 @@ Tree::Tree(std::span<const std::string> paths, Options opts)
       const auto [parent_path, name] = Path(path).Split();
       Node* const parent = GetOrCreateDirNode(parent_path);
       Node* const node = CreateFile(z, id, parent, name, mode);
-      assert(node->parent == parent);
+      assert(!node->IsDir());
       parent->AddChild(node);
+      total_block_count_++;
       files_by_original_path_[original_path.WithoutTrailingSeparator()] = node;
-      total_block_count_ += 1;
-      total_block_count_ += node->GetStat().st_blocks;
 
       if (is_hard_link) {
         hard_links.push_back(node);
         continue;
       }
+
+      total_block_count_ += node->GetBlockCount();
 
       if (!zip_encryption_method_supported(sb.encryption_method, 1)) {
         ZipError e(StrCat("Cannot decrypt ", *node, ": ",
@@ -722,7 +725,7 @@ Tree::EntryAttributes Tree::GetEntryAttributes(
     throw ZipError(StrCat("Cannot get attributes of entry #", id), z);
   }
 
-  mode_t mode = static_cast<mode_t>(attr >> 16);
+  mode_t mode = mode_t(attr >> 16);
   bool is_hard_link = false;
 
   // PKWARE describes "OS made by" now (since 1998) as follows: The upper byte
@@ -830,9 +833,12 @@ Node* Tree::CreateFile(zip_t* const z,
   assert(parent);
   assert(!name.empty());
   assert(id >= 0);
-  Node::Ptr node(new Node{
-      .id = id, .zip = z, .parent = parent, .name = std::string(name)});
-  Node::Init(*node, z, id, mode);
+  Node::Ptr node(new Node{.id = id,
+                          .zip = z,
+                          .parent = parent,
+                          .name = std::string(name),
+                          .mode = mode});
+  node->Init();
   return RenameIfCollision(std::move(node));
 }
 
@@ -939,9 +945,11 @@ Node* Tree::GetOrCreateDirNode(std::string_view path) {
                              .path_length = segment.path_length,
                              .path_hash = segment.path_hash,
                              .name = std::string(segment.name),
-                             .mode = static_cast<mode_t>(S_IFDIR | 0777),
+                             .mode = mode_t(S_IFDIR | 0777),
                              .nlink = 2});
+    assert(child->IsDir());
     node->AddChild(child.get());
+    total_block_count_++;
 
 #ifndef NDEBUG
     child->ComputePathHash();
@@ -952,7 +960,6 @@ Node* Tree::GetOrCreateDirNode(std::string_view path) {
     RehashIfNecessary();
     [[maybe_unused]] const auto [pos, ok] = nodes_by_path_.insert(*child);
     assert(ok);
-    node->nlink++;
     node = child.release();
   }
 
@@ -1007,7 +1014,7 @@ void Tree::Trim(Node& a) {
   a.atime = p->atime;
   a.ctime = p->ctime;
   a.target = std::move(p->target);
-  a.cached_reader = std::move(p->cached_reader);
+  a.reader = std::move(p->reader);
   a.mode = p->mode;
   a.nlink = p->nlink;
   a.zip = p->zip;
@@ -1032,7 +1039,7 @@ void Tree::Trim(Node& a) {
       << "Use `-o notrim` if you want to keep these intermediate directories";
 
   while (p != &a) {
-    total_block_count_ -= 1;
+    total_block_count_--;
     Node* const q = p->parent;
     delete p;
     p = q;

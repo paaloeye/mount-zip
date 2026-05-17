@@ -75,11 +75,10 @@ class Tree {
   Node* FindNode(const HashedStringView& path);
 
   // Finds a node in the tree by its full absolute path.
-  Node* FindNode(std::string_view path) {
+  Node* FindNode(std::string_view const path) {
     return FindNode(HashedStringView(Path(path).WithoutTrailingSeparator()));
   }
 
-  static const blksize_t block_size = Node::block_size;
   blkcnt_t GetBlockCount() const { return total_block_count_; }
   fsfilcnt_t GetNodeCount() const { return nodes_by_path_.size(); }
 
@@ -197,12 +196,8 @@ class Tree {
   std::unordered_map<std::string_view, Node*> files_by_original_path_;
 
   // Root node.
-  Node* const root_ = [] {
-    Node* const n = new Node{
-        .parent = nullptr, .name = "/", .mode = S_IFDIR | 0755, .nlink = 2};
-    n->ComputePathHash();
-    return n;
-  }();
+  Node* const root_ = RenameIfCollision(Node::Ptr(
+      new Node{.name = "/", .mode = mode_t(S_IFDIR | 0777), .nlink = 2}));
 
   blkcnt_t total_block_count_ = 1;
 

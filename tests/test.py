@@ -1902,7 +1902,7 @@ def TestMasks():
     )
 
     want_tree = {
-      '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 24},
+      '.': {'ino': 1, 'mode': 'drwxrwxrwx', 'nlink': 24},
       'Dir000': {'uid': 270632, 'gid': 89939, 'mode': 'd---------'},
       'Dir001': {'uid': 270632, 'gid': 89939, 'mode': 'd--------x'},
       'Dir002': {'uid': 270632, 'gid': 89939, 'mode': 'd-------w-'},
@@ -2010,7 +2010,7 @@ def TestArchiveWithManyFiles():
         'collisions.zip',
         want_tree,
         options=['-o', 'notrim'],
-        want_blocks=100007,
+        want_blocks=100017,
         want_inodes=100014,
         strict=False,
         use_md5=False,
@@ -2034,7 +2034,7 @@ def TestArchiveWithManyFiles():
         'collisions.zip',
         want_tree,
         options=[],
-        want_blocks=99997,
+        want_blocks=100007,
         want_inodes=100004,
         strict=False,
         use_md5=False,
@@ -2130,7 +2130,7 @@ def TestDirectories():
     MountArchiveAndCheckTree('deep.zip',
                          want_tree,
                          options=['-o', 'notrim'],
-                         want_blocks=69,
+                         want_blocks=1759,
                          want_inodes=1725,
                          strict=False)
 
@@ -2581,7 +2581,7 @@ def TestArchiveWithSpecialFiles():
         },
     }
 
-    MountArchiveAndCheckTree(zip_name, want_tree, want_blocks=19, want_inodes=15)
+    MountArchiveAndCheckTree(zip_name, want_tree, want_blocks=17, want_inodes=15)
 
     # Check that the inode numbers of hardlinks match
     got_tree, _ = MountArchiveAndGetTree(zip_name)
@@ -2801,7 +2801,7 @@ def TestArchiveWithSpecialFiles():
     MountArchiveAndCheckTree(
         zip_name,
         want_tree,
-        want_blocks=11,
+        want_blocks=9,
         want_inodes=7,
         options=['-o', 'nospecials'],
     )
@@ -2928,7 +2928,7 @@ def TestArchiveWithSpecialFiles():
     MountArchiveAndCheckTree(
         zip_name,
         want_tree,
-        want_blocks=19,
+        want_blocks=17,
         want_inodes=15,
         options=['-o', 'default_permissions'],
     )
@@ -3031,7 +3031,7 @@ def TestArchiveWithSpecialFiles():
     MountArchiveAndCheckTree(
         zip_name,
         want_tree,
-        want_blocks=19,
+        want_blocks=17,
         want_inodes=15,
         options=['-o', 'default_permissions,fmask=0'],
     )

@@ -43,7 +43,7 @@ endif
 STD_CXXFLAGS = -std=c++23
 COMMON_CXXFLAGS = $(STD_CXXFLAGS) -Wall -Wextra -Wno-nullability-extension \
                    -Wno-sign-compare -Wno-missing-field-initializers \
-                   -pedantic -I. -D_FILE_OFFSET_BITS=64 -D_TIME_BITS=64 $(FUSE_CXXFLAGS)
+                   -I. -D_FILE_OFFSET_BITS=64 -D_TIME_BITS=64 $(FUSE_CXXFLAGS)
 
 ifeq ($(DEBUG), 1)
 COMMON_CXXFLAGS += -O0 -g

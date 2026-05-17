@@ -72,13 +72,14 @@ std::ostream& operator<<(std::ostream& out, FileType t);
 // Type aliases for shorter code.
 using Stat = struct stat;
 
-// Represents a named file or directory entry in the filesystem tree.
+// A node of the virtual file system: either a directory or a file.
 struct Node {
   // Nodes are dynamically allocated and passed around by unique_ptr when
   // the ownership is transferred.
   using Ptr = std::unique_ptr<Node>;
 
   // Constants and settings shared by all nodes.
+  static const blksize_t block_size = 512;
   static const timespec g_now;
   static const uid_t g_uid;
   static const gid_t g_gid;
@@ -108,11 +109,14 @@ struct Node {
 
   // Inode-specific data.
   ino_t ino = ++ino_count;
-  zip_uint64_t size = 0;
+
+  // Number of bytes of this file.
+  i64 size = 0;
+
+  // Device number for special files.
   dev_t dev = 0;
 
   // --- Architecture-dependent members (8 bytes on 64-bit, 4 bytes on 32-bit)
-  // --- Grouped in even numbers to maintain 8-byte alignment on 32-bit systems.
 
   // Reference to the ZIP archive.
   zip_t* zip = nullptr;
@@ -124,7 +128,7 @@ struct Node {
   // root directory which has a null parent pointer.
   Node* parent = nullptr;
 
-  mutable Reader::Ptr cached_reader;
+  Reader::Ptr reader;
 
   size_t path_length = 0;
   size_t path_hash = 0;
@@ -145,7 +149,7 @@ struct Node {
                              bi::cache_last<true>>;
   Children children;
 
-  // Hooks used to index Nodes by full path and by original path.
+  // Hook used to index Nodes by full path.
   using ByPath = bi::unordered_set_member_hook<LinkMode, bi::store_hash<false>>;
   ByPath by_path;
 
@@ -162,39 +166,62 @@ struct Node {
   uid_t uid = g_uid;
   gid_t gid = g_gid;
   mode_t mode = 0;
-  mutable nlink_t nlink = 1;
+  nlink_t nlink = 1;
 
   // Number of entries whose name have initially collided with this node.
   int collision_count = 0;
 
-  static const blksize_t block_size = 512;
-
-  // Methods.
+  // Returns true if this node is the root directory of the virtual file system.
   bool IsRoot() const { return !parent; }
 
-  const Node* GetTarget() const { return hardlink_target ? hardlink_target : this; }
-  Node* GetTarget() { return hardlink_target ? hardlink_target : this; }
+  // Returns the FileType (e.g. Regular file, Directory, Symlink) of this node.
+  FileType GetType() const { return GetFileType(mode); }
 
+  // Returns true if this node is a directory.
+  bool IsDir() const { return S_ISDIR(mode); }
+
+  // Initialize from ZIP entry.
+  void Init();
+
+  // Adds a child node to this directory node.
+  // This directory becomes the owner of the child's parent pointer.
+  // Precondition: IsDir() is true.
+  void AddChild(Node* child);
+
+  // Recomputes this Node's path length and hash based on its name and its
+  // parent's path length and hash. This is used for fast lookup by path.
+  void ComputePathHash();
+
+  // Returns the number of blocks used by this node in the virtual file system.
+  // This accounts for the file size and any holes (sparse regions).
+  i64 GetBlockCount() const { return (size + block_size - 1) / block_size; }
+
+  // Returns a pointer to the actual data node. If this node is a hardlink,
+  // returns the target node; otherwise returns 'this'.
+  const Node* GetTarget() const { return hardlink_target ?: this; }
+  Node* GetTarget() { return hardlink_target ?: this; }
+
+  // Returns the POSIX 'struct stat' representation of this node's metadata.
   Stat GetStat() const;
 
-  FileType GetType() const { return GetFileType(mode); }
-  bool IsDir() const { return GetType() == FileType::Directory; }
-
-  // Gets the full absolute path of this node.
+  // Returns the full absolute path of this node within the virtual file system.
   std::string GetPath() const;
+
+  // Returns true if this node's full absolute path matches the given string.
   bool HasPath(std::string_view path) const;
-  void ComputePathHash();
-  void AddChild(Node* child);
+
+  // If this node is a directory which only has one child which is also a
+  // directory, returns a pointer to that child. Otherwise returns nullptr.
+  // This is used for tree trimming/optimization.
   Node* GetUniqueChildDirectory();
 
   bool CacheAll(std::function<void(ssize_t)> progress = {});
 
   // Gets a Reader to read file contents.
-  Reader::Ptr GetReader() const;
-
-  static void Init(Node& node, zip_t* zip, i64 id, mode_t mode);
+  Reader::Ptr GetReader();
 };
 
-std::ostream& operator<<(std::ostream& out, const Node& node);
+// Formats a Node for logging output (e.g. "File /path/to/file").
+std::ostream& operator<<(std::ostream& out, const Node& n);
 
 #endif  // NODE_H

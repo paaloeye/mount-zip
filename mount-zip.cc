@@ -148,7 +148,7 @@ Tree* g_tree = nullptr;
 struct Operations : fuse_operations {
  private:
   struct FileHandle {
-    const Node* const node;
+    Node* const node;
     Reader::Ptr reader;
   };
 
@@ -171,7 +171,7 @@ struct Operations : fuse_operations {
   }
 
   // Finds a node by full path.
-  static const Node* FindNode(std::string_view const path) {
+  static Node* FindNode(std::string_view const path) {
     assert(g_tree);
     return g_tree->FindNode(path);
   }
@@ -185,7 +185,7 @@ struct Operations : fuse_operations {
     fuse_file_info* const fi = nullptr;
 #endif
 
-    const Node* n;
+    Node* n;
 
     if (fi) {
       FileHandle* const h = reinterpret_cast<FileHandle*>(fi->fh);
@@ -288,7 +288,7 @@ struct Operations : fuse_operations {
     assert(path);
     assert(fi);
 
-    const Node* const n = FindNode(path);
+    Node* const n = FindNode(path);
     if (!n) {
       LOG(ERROR) << "Cannot open " << Path(path) << ": No such item";
       return -ENOENT;
@@ -362,7 +362,7 @@ struct Operations : fuse_operations {
     assert(buf);
     assert(size > 1);
 
-    const Node* const n = FindNode(path);
+    Node* const n = FindNode(path);
     if (!n) {
       LOG(ERROR) << "Cannot read link " << Path(path) << ": No such item";
       return -ENOENT;
@@ -388,8 +388,8 @@ struct Operations : fuse_operations {
   static int StatFs(const char*, StatVfs* const z) {
     assert(z);
     assert(g_tree);
-    z->f_bsize = Tree::block_size;
-    z->f_frsize = Tree::block_size;
+    z->f_bsize = Node::block_size;
+    z->f_frsize = Node::block_size;
     z->f_blocks = g_tree->GetBlockCount();
     z->f_bfree = 0;
     z->f_bavail = 0;

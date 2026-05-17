@@ -65,7 +65,7 @@ bool Node::original_permissions = false;
 
 ino_t Node::ino_count = 0;
 
-void Node::Init(Node& node, zip_t* const zip, const i64 id, const mode_t mode) {
+void Node::Init() {
   assert(zip);
   zip_stat_t st;
   if (zip_stat_index(zip, id, 0, &st) < 0) {
@@ -79,9 +79,11 @@ void Node::Init(Node& node, zip_t* const zip, const i64 id, const mode_t mode) {
   // directories (see zip_stat_index.c from libzip)
   assert((st.valid & need_valid) == need_valid);
 
-  node.mode = mode;
-  node.size = st.size;
-  node.mtime = {.tv_sec = st.mtime};
+  if (!IsDir()) {
+    size = st.size;
+  }
+
+  mtime = {.tv_sec = st.mtime};
 
   bool has_pkware_field = false;
 
@@ -111,35 +113,35 @@ void Node::Init(Node& node, zip_t* const zip, const i64 id, const mode_t mode) {
       }
 
       if (f.mtime.tv_sec != -1) {
-        node.mtime = f.mtime;
+        mtime = f.mtime;
       }
 
       if (f.atime.tv_sec != -1) {
-        node.atime = f.atime;
+        atime = f.atime;
       }
 
       if (f.ctime.tv_sec != -1) {
-        node.ctime = f.ctime;
+        ctime = f.ctime;
       }
 
       if (f.uid != -1) {
-        node.uid = f.uid;
+        uid = f.uid;
       }
 
       if (f.gid != -1) {
-        node.gid = f.gid;
+        gid = f.gid;
       }
 
       if (f.dev != -1) {
-        node.dev = f.dev;
+        dev = f.dev;
       }
 
       // Use PKWARE link target only if link target in Info-ZIP format is not
       // specified (empty file content).
       if (!f.link_target.empty()) {
-        node.target = std::string(f.link_target);
-        if (S_ISLNK(mode) && node.size == 0) {
-          node.size = f.link_target.size();
+        target = std::string(f.link_target);
+        if (S_ISLNK(mode) && size == 0) {
+          size = f.link_target.size();
         }
       }
 
@@ -150,8 +152,8 @@ void Node::Init(Node& node, zip_t* const zip, const i64 id, const mode_t mode) {
   }
 
   // InfoZIP may produce FIFO-marked node with content, PkZip - can't.
-  if (S_ISFIFO(mode) && (node.size != 0 || !has_pkware_field)) {
-    SetFileType(&node.mode, FileType::File);
+  if (S_ISFIFO(mode) && (size != 0 || !has_pkware_field)) {
+    SetFileType(&mode, FileType::File);
   }
 }
 
@@ -160,7 +162,7 @@ Stat Node::GetStat() const {
   st.st_ino = ino;
   st.st_nlink = GetTarget()->nlink;
   st.st_blksize = block_size;
-  st.st_blocks = (size + block_size - 1) / block_size;
+  st.st_blocks = GetBlockCount();
   st.st_size = size;
   st.st_rdev = dev;
 
@@ -216,7 +218,7 @@ Stat Node::GetStat() const {
 }
 
 std::string Node::GetPath() const {
-  if (!parent) {
+  if (IsRoot()) {
     assert(name == "/");
     return "/";
   }
@@ -227,14 +229,14 @@ std::string Node::GetPath() const {
   size_t n = 0;
   const Node* node = this;
   do {
-    assert(node->parent);
+    assert(!node->IsRoot());
     nodes.push_back(node);
     n += node->name.size() + 1;
     node = node->parent;
-  } while (node->parent);
+  } while (!node->IsRoot());
 
   assert(node);
-  assert(!node->parent);
+  assert(node->IsRoot());
   assert(node->name == "/");
 
   std::string path;
@@ -253,45 +255,62 @@ std::string Node::GetPath() const {
 }
 
 bool Node::HasPath(std::string_view path) const {
-  if (!parent) {
-    return path == "/";
+  const Node* node = this;
+
+  if (!node->IsRoot()) {
+    while (true) {
+      if (!path.ends_with(node->name)) {
+        return false;
+      }
+
+      path.remove_suffix(node->name.size());
+      node = node->parent;
+      if (node->IsRoot()) {
+        break;
+      }
+
+      if (!path.ends_with('/')) {
+        return false;
+      }
+
+      path.remove_suffix(1);
+    }
   }
 
-  if (path.size() != path_length) {
-    return false;
-  }
-
-  if (!path.ends_with(name)) {
-    return false;
-  }
-
-  return parent->HasPath(
-      path.substr(0, path_length - name.size() - (parent->parent ? 1 : 0)));
+  assert(node->IsRoot());
+  return path == node->name;
 }
 
+// Recomputes this Node's path length and hash.
 void Node::ComputePathHash() {
   path_length = 0;
   path_hash = 0;
 
-  if (parent) {
+  if (!IsRoot()) {
     path_length = parent->path_length;
     path_hash = parent->path_hash;
-    if (parent->parent) {
+    if (!parent->IsRoot()) {
       ++path_length;
       boost::hash_combine(path_hash, '/');
     }
   }
 
   path_length += name.size();
-  for (const char c : name) {
+  for (char const c : name) {
     boost::hash_combine(path_hash, c);
   }
 }
 
 void Node::AddChild(Node* const child) {
+  assert(IsDir());
+  assert(!hardlink_target);
+  assert(nlink >= 2);
   assert(child);
-  assert(this == child->parent);
+  assert(child->parent == this);
   children.push_back(*child);
+  size += block_size;
+  assert(children.size() == GetBlockCount());
+  nlink += child->IsDir();
 }
 
 Node* Node::GetUniqueChildDirectory() {
@@ -320,8 +339,8 @@ Node* Node::GetUniqueChildDirectory() {
 }
 
 bool Node::CacheAll(std::function<void(ssize_t)> progress) {
-  const Node* const t = GetTarget();
-  assert(!t->cached_reader);
+  Node* const t = GetTarget();
+  assert(!t->reader);
   if (t->size == 0) {
     LOG(DEBUG) << "No need to cache " << *this << ": Empty file";
     return false;
@@ -351,17 +370,16 @@ bool Node::CacheAll(std::function<void(ssize_t)> progress) {
     return false;
   }
 
-  t->cached_reader =
-      CacheFile(std::move(file), t->id, t->size, std::move(progress));
+  t->reader = CacheFile(std::move(file), t->id, t->size, std::move(progress));
   return true;
 }
 
-Reader::Ptr Node::GetReader() const {
-  const Node* const t = GetTarget();
-  if (t->cached_reader) {
-    LOG(DEBUG) << *t->cached_reader << ": Reusing Cached " << *t->cached_reader
-               << " for " << *this;
-    return t->cached_reader->AddRef();
+Reader::Ptr Node::GetReader() {
+  Node* const t = GetTarget();
+  if (t->reader) {
+    LOG(DEBUG) << *t->reader << ": Reusing Cached " << *t->reader << " for "
+               << *this;
+    return t->reader->AddRef();
   }
 
   if (!t->target.empty()) {
@@ -390,7 +408,7 @@ Reader::Ptr Node::GetReader() const {
   Reader::Ptr reader(seekable
                          ? new UnbufferedReader(std::move(file), t->id, t->size)
                          : new BufferedReader(t->zip, std::move(file), t->id,
-                                              t->size, &t->cached_reader));
+                                              t->size, &t->reader));
 
   LOG(DEBUG) << *reader << ": Opened " << *this << ", seekable = " << seekable;
   return reader;
