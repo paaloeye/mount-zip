@@ -777,7 +777,7 @@ Tree::EntryAttributes Tree::GetEntryAttributes(
       // http://en.wikipedia.org/wiki/File_Allocation_Table#attributes
       // FILE_ATTRIBUTE_READONLY
       if ((attr & 1) == 0) {
-        mode |= 0220;
+        mode |= 0222;
       }
 
       if (is_dir) {
@@ -790,9 +790,9 @@ Tree::EntryAttributes Tree::GetEntryAttributes(
 
     default:
       if (is_dir) {
-        mode = S_IFDIR | 0775;
+        mode = S_IFDIR | 0777;
       } else {
-        mode = S_IFREG | 0664;
+        mode = S_IFREG | 0666;
       }
   }
 
