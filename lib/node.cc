@@ -22,7 +22,7 @@
 #include <memory>
 #include <vector>
 
-#include <boost/container_hash/hash.hpp>
+#include <boost/functional/hash.hpp>
 
 #include <zip.h>
 
