@@ -43,8 +43,37 @@ args = parser.parse_args()
 logging.getLogger().setLevel('DEBUG' if args.verbose else 'INFO')
 is_fast = args.fast
 
+# Directory of this test program.
+script_dir = os.path.dirname(os.path.realpath(__file__))
+
+# Directory containing the archives to mount.
+data_dir = os.path.join(script_dir, 'data')
+
+# Path of the FUSE mounter.
+mount_program = os.path.join(script_dir, '..', 'out', 'mount-zip')
+
+sr = subprocess.run([mount_program, '--version'],
+                    capture_output=True,
+                    encoding='UTF-8')
+
+
+def GetFuseMajorVersion():
+    for line in sr.stdout.split('\n'):
+        if 'FUSE library version' in line:
+            # Handle "FUSE library version 3.x" and "FUSE library version: 3.x"
+            version_str = line.split('version')[-1].strip(': ').split()[0]
+            return int(version_str.split('.')[0])
+    return 0
+
+
+fuse_major_version = GetFuseMajorVersion()
+logging.info(f'FUSE major version: {fuse_major_version}')
+
 on_mac = sys.platform.startswith('darwin')
 on_linux = sys.platform.startswith('linux')
+
+# On macOS, using the default TMPDIR causes Finder to use CPU excessively.
+tmp_dir_base = '/tmp' if on_mac else None
 
 has_memcache = not on_mac
 if not has_memcache:
@@ -54,6 +83,9 @@ has_xattrs = not on_mac
 if not has_memcache:
     logging.info('Will skip tests for xattrs')
 
+has_holes = not on_mac and fuse_major_version >= 3
+if not has_holes:
+    logging.info('Will skip tests for holes')
 
 # Computes the MD5 hash of the given file.
 # Returns the MD5 hash as an hexadecimal string.
@@ -64,6 +96,28 @@ def md5(path):
         while chunk := f.read(4096):
             h.update(chunk)
     return h.hexdigest()
+
+
+# Gets the hole map of the given file.
+def GetHoleMap(path):
+    m = []
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            i = 0
+            while True:
+                j = os.lseek(fd, i, os.SEEK_HOLE)
+                if j < i: break
+                m.append(j)
+                i = os.lseek(fd, j, os.SEEK_DATA)
+                if i <= j: break
+                m.append(i)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        if e.errno != errno.ENXIO:
+            LogError(f'Cannot get holes from {path!r}: {e}');
+    return m
 
 
 # Walks the given directory.
@@ -96,6 +150,9 @@ def GetTree(root, use_md5=True):
         if stat.S_ISREG(mode):
             line['size'] = st.st_size
             line['blocks'] = st.st_blocks
+            if has_holes and st.st_blocks * 512 < st.st_size:
+                logging.debug(f'Sparse file: {path!r}')
+                line['holes'] = GetHoleMap(path)
             try:
                 if use_md5:
                     line['md5'] = md5(path)
@@ -165,6 +222,9 @@ def CheckTree(got_tree, want_tree, strict=False):
                     # raw rdev values differ from Linux. Skip on macOS.
                     continue
 
+                if not has_holes and key == 'holes':
+                    continue
+
                 got_value = got_entry.get(key)
 
                 if key in ('atime', 'mtime',
@@ -183,14 +243,8 @@ def CheckTree(got_tree, want_tree, strict=False):
         LogError(f'Found {len(got_tree)} unexpected entries: {got_tree}')
 
 
-# Directory of this test program.
-script_dir = os.path.dirname(os.path.realpath(__file__))
-
 # Directory containing the archives to mount.
 data_dir = os.path.join(script_dir, 'data')
-
-# Path of the FUSE mounter.
-mount_program = os.path.join(script_dir, '..', 'out', 'mount-zip')
 
 env = os.environ.copy()
 if not is_fast:
@@ -208,7 +262,7 @@ def Unmount(mount_point):
 
 @contextmanager
 def MountArchive(zip_names, options=[], password='', env=env):
-    with tempfile.TemporaryDirectory() as mount_point:
+    with tempfile.TemporaryDirectory(dir=tmp_dir_base) as mount_point:
         if type(zip_names) is not list: zip_names = [zip_names]
         zip_paths = [
             os.path.join(script_dir, 'data', zip_name)
@@ -2009,11 +2063,11 @@ def TestArchiveWithManyFiles():
     MountArchiveAndCheckTree(
         'collisions.zip',
         want_tree,
-        options=['-o', 'notrim'],
         want_blocks=100017,
         want_inodes=100014,
         strict=False,
         use_md5=False,
+        options=['-o', 'notrim'],
     )
 
     want_tree = {
@@ -2033,7 +2087,6 @@ def TestArchiveWithManyFiles():
     MountArchiveAndCheckTree(
         'collisions.zip',
         want_tree,
-        options=[],
         want_blocks=100007,
         want_inodes=100004,
         strict=False,
@@ -2041,7 +2094,7 @@ def TestArchiveWithManyFiles():
     )
 
 
-# Tests archives with lots of directories or with the `nodir` option.
+# Tests archives with lots of directories or with the `nodirs` option.
 def TestDirectories():
     want_tree = {
     '.': {'mode': 'drwxr-xr-x', 'nlink': 2},
@@ -2137,12 +2190,13 @@ def TestDirectories():
 
 # Tests that a big file can be accessed in random order.
 def TestBigArchive(options=[]):
+    if is_fast: return
     zip_name = 'big.zip'
     s = f'Test {zip_name!r}'
     if options:
         s += f', options = {" ".join(options)!r}'
     logging.info(s)
-    with tempfile.TemporaryDirectory() as mount_point:
+    with tempfile.TemporaryDirectory(dir=tmp_dir_base) as mount_point:
         zip_path = os.path.join(script_dir, 'data', zip_name)
         logging.debug(f'Mounting {zip_path!r} on {mount_point!r}...')
         subprocess.run(
@@ -2194,7 +2248,7 @@ def TestBigArchive(options=[]):
                 os.close(fd)
         finally:
             logging.debug(f'Unmounting {zip_path!r} from {mount_point!r}...')
-            subprocess.run(['umount', '-l', mount_point], check=True)
+            Unmount(mount_point)
             logging.debug(f'Unmounted {zip_path!r} from {mount_point!r}')
 
 
@@ -2202,7 +2256,7 @@ def TestBigArchive(options=[]):
 def TestManyNodes():
     zip_name = 'many_nodes.zip'
     logging.info(f'Test {zip_name!r}')
-    with tempfile.TemporaryDirectory() as mount_point:
+    with tempfile.TemporaryDirectory(dir=tmp_dir_base) as mount_point:
         zip_path = os.path.join(script_dir, 'data', zip_name)
         logging.debug(f'Mounting {zip_path!r} on {mount_point!r}...')
         subprocess.run(
@@ -2235,22 +2289,22 @@ def TestManyNodes():
                 LogError(
                     f'Mismatch for st.f_files: got: {st.f_files}, want: {want_inodes}'
                 )
-
         finally:
             logging.debug(f'Unmounting {zip_path!r} from {mount_point!r}...')
-            subprocess.run(['umount', '-l', mount_point], check=True)
+            Unmount(mount_point)
             logging.debug(f'Unmounted {zip_path!r} from {mount_point!r}')
 
 
 # Tests that a big file can be accessed in somewhat random order even with no
 # cache file.
 def TestBigArchiveNoCache(options=['-o', 'nocache']):
+    if is_fast: return
     zip_name = 'big.zip'
     s = f'Test {zip_name!r}'
     if options:
         s += f', options = {" ".join(options)!r}'
     logging.info(s)
-    with tempfile.TemporaryDirectory() as mount_point:
+    with tempfile.TemporaryDirectory(dir=tmp_dir_base) as mount_point:
         zip_path = os.path.join(script_dir, 'data', zip_name)
         logging.debug(f'Mounting {zip_path!r} on {mount_point!r}...')
         subprocess.run(
@@ -2261,7 +2315,7 @@ def TestBigArchiveNoCache(options=['-o', 'nocache']):
             encoding='UTF-8',
         )
         try:
-            logging.debug(f'Mounted ZIP {zip_path!r} on {mount_point!r}')
+            logging.debug(f'Mounted {zip_path!r} on {mount_point!r}')
             GetTree(mount_point, use_md5=False)
             fd = os.open(os.path.join(mount_point, 'big.txt'), os.O_RDONLY)
             try:
@@ -2282,16 +2336,11 @@ def TestBigArchiveNoCache(options=['-o', 'nocache']):
                 os.close(fd)
         finally:
             logging.debug(f'Unmounting {zip_path!r} from {mount_point!r}...')
-            subprocess.run(['umount', '-l', mount_point], check=True)
+            Unmount(mount_point)
             logging.debug(f'Unmounted {zip_path!r} from {mount_point!r}')
 
 
-# Tests that a big file can be accessed in random order with memory cache.
-def TestBigArchiveMemCache():
-    TestBigArchive(options=['-o', 'memcache'])
-
-
-# Tests encrypted ZIP.
+# Tests encrypted archive.
 def TestEncryptedArchive():
     zip_name = 'different-encryptions.zip'
 
@@ -3047,8 +3096,6 @@ def TestInvalidArchive():
         CheckArchiveMountingError(f.name, 21 if os.getuid() != 0 else 29)
 
 
-logging.getLogger().setLevel('INFO')
-
 TestArchiveWithDefaultOptions()
 TestArchiveFileNameEncoding()
 TestArchiveWithSpecialFiles()
@@ -3063,7 +3110,7 @@ if not is_fast:
     TestBigArchive()
     TestBigArchive(options=['-o', 'precache'])
     TestBigArchiveNoCache()
-    TestBigArchiveMemCache()
+    if has_memcache: TestBigArchive(options=['-o', 'memcache'])
     TestManyNodes()
 
 if error_count:
