@@ -61,7 +61,7 @@ const uid_t Node::g_uid = getuid();
 const gid_t Node::g_gid = getgid();
 mode_t Node::fmask = 0022;
 mode_t Node::dmask = 0022;
-bool Node::original_permissions = false;
+bool Node::enforce_permissions = false;
 
 ino_t Node::ino_count = 0;
 
@@ -147,7 +147,7 @@ Stat Node::GetStat() const {
   st.st_ctim = ctime;
 #endif
 
-  if (original_permissions) {
+  if (enforce_permissions) {
     st.st_uid = uid;
     st.st_gid = gid;
     st.st_mode = mode;

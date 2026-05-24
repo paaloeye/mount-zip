@@ -87,7 +87,7 @@ struct Node {
   static const gid_t g_gid;
   static mode_t fmask;
   static mode_t dmask;
-  static bool original_permissions;
+  static bool enforce_permissions;
   static ino_t ino_count;
 
 #ifdef NDEBUG

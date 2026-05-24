@@ -109,7 +109,8 @@ General options:
     -o nodirs              no directories
     -o nospecials          no special files (FIFOs, sockets, devices)
     -o nosymlinks          no symbolic links
-    -o nohardlinks         no hard links)"
+    -o nohardlinks         no hard links
+    -o enforce_permissions enforce standard UNIX permissions)"
 #if FUSE_USE_VERSION >= 30
          R"(
     -o direct_io           use direct I/O)"
@@ -574,7 +575,7 @@ static int ProcessArg(void* data,
       return DISCARD;
 
     case KEY_DEFAULT_PERMISSIONS:
-      Node::original_permissions = true;
+      Node::enforce_permissions = true;
       return DISCARD;
 
 #if FUSE_USE_VERSION >= 30
@@ -658,6 +659,7 @@ int main(int argc, char* argv[]) try {
       FUSE_OPT_KEY("nospecials", KEY_NO_SPECIALS),
       FUSE_OPT_KEY("nosymlinks", KEY_NO_SYMLINKS),
       FUSE_OPT_KEY("nohardlinks", KEY_NO_HARD_LINKS),
+      FUSE_OPT_KEY("enforce_permissions", KEY_DEFAULT_PERMISSIONS),
       FUSE_OPT_KEY("default_permissions", KEY_DEFAULT_PERMISSIONS),
 #if FUSE_USE_VERSION >= 30
       FUSE_OPT_KEY("direct_io", KEY_DIRECT_IO),
@@ -694,7 +696,7 @@ int main(int argc, char* argv[]) try {
   fuse_opt_add_arg(&args, "use_ino");
 #endif
 
-  if (Node::original_permissions) {
+  if (Node::enforce_permissions) {
     fuse_opt_add_arg(&args, "-o");
     fuse_opt_add_arg(&args, "default_permissions");
   }

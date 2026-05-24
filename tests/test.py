@@ -1687,7 +1687,7 @@ def TestMultiple():
     )
 
 
-# Tests -o dmask, fmask and default_permissions.
+# Tests -o dmask, fmask and enforce_permissions.
 def TestMasks():
     want_tree = {
       '.': {'ino': 1, 'mode': 'drwxr-xr-x', 'nlink': 24},
@@ -1952,7 +1952,7 @@ def TestMasks():
         'permissions.zip',
         want_tree,
         use_md5=False,
-        options=['-o', 'default_permissions'],
+        options=['-o', 'enforce_permissions'],
     )
 
     want_tree = {
@@ -2007,7 +2007,7 @@ def TestMasks():
         'permissions.zip',
         want_tree,
         use_md5=False,
-        options=['-o', 'default_permissions,dmask=0,fmask=0'],
+        options=['-o', 'enforce_permissions,dmask=0,fmask=0'],
     )
 
 
@@ -2879,7 +2879,7 @@ def TestArchiveWithSpecialFiles():
         options=['-o', 'nosymlinks,nohardlinks,nospecials'],
     )
 
-    # Tests -o default_permissions
+    # Tests -o enforce_permissions
     want_tree = {
         '.': {
             'ino': 1,
@@ -2979,10 +2979,10 @@ def TestArchiveWithSpecialFiles():
         want_tree,
         want_blocks=17,
         want_inodes=15,
-        options=['-o', 'default_permissions'],
+        options=['-o', 'enforce_permissions'],
     )
 
-    # Tests -o default_permissions,fmask=0
+    # Tests -o enforce_permissions,fmask=0
     want_tree = {
         '.': {
             'ino': 1,
@@ -3082,7 +3082,7 @@ def TestArchiveWithSpecialFiles():
         want_tree,
         want_blocks=17,
         want_inodes=15,
-        options=['-o', 'default_permissions,fmask=0'],
+        options=['-o', 'enforce_permissions,fmask=0'],
     )
 
 

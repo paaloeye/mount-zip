@@ -98,7 +98,7 @@ working directory.
 :   Set the group ID of all the items in the mounted archive (default is current
     group).
 
-**-o default_permissions**
+**-o enforce_permissions**
 :   Use the user ID, group ID and permissions stored with each item in the
     archive.
 
@@ -419,7 +419,7 @@ mnt
 devices) recorded in the ZIP archive:
 
 ```
-$ mount-zip -o default_permissions pkware-specials.zip mnt
+$ mount-zip -o enforce_permissions pkware-specials.zip mnt
 
 $ ls -n mnt
 brw-rw---- 1    0    6 8, 1 Aug  3  2019 block
@@ -545,12 +545,13 @@ and group, with standard read permissions.
 You can explicitly set the user and group of all items in the mounted archive
 using the `-o uid` and `-o gid` options with the desired numerical IDs.
 
-### Using Archive Permissions (`-o default_permissions`)
+### Using Archive Permissions (`-o enforce_permissions`)
 
-The `-o default_permissions` option instructs **mount-zip** to use the exact
+The `-o enforce_permissions` option instructs **mount-zip** to use the exact
 UID, GID, and Unix permission bits stored within the archive for each item. This
 includes support for special bits such as **SUID**, **SGID**, and **SVTX**
-(sticky bit).
+(sticky bit). Note that this may result in access denied errors if you are not
+the owner of the files inside the archive.
 
 ### Permission Masks (`-o dmask=M`, `-o fmask=M`)
 

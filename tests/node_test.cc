@@ -116,13 +116,13 @@ TEST(NodeTest, GetStat) {
   n.uid = 1000;
   n.gid = 1000;
 
-  Node::original_permissions = true;
+  Node::enforce_permissions = true;
   Node::fmask = 0022;
   Stat st = n.GetStat();
   EXPECT_EQ(st.st_mode, static_cast<mode_t>(S_IFREG | 0755));
   EXPECT_EQ(st.st_uid, 1000);
 
-  Node::original_permissions = false;
+  Node::enforce_permissions = false;
   st = n.GetStat();
   EXPECT_EQ(st.st_mode, static_cast<mode_t>(S_IFREG | 0755));
 }
