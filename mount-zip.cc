@@ -447,9 +447,9 @@ enum {
   KEY_ENCODING,
   KEY_PRE_CACHE,
   KEY_MEM_CACHE,
+  KEY_NO_CACHE,
   KEY_NO_MERGE,
   KEY_NO_TRIM,
-  KEY_NO_CACHE,
   KEY_NO_DIRS,
   KEY_NO_SPECIALS,
   KEY_NO_SYMLINKS,
@@ -546,16 +546,16 @@ static int ProcessArg(void* data,
       Reader::SetCacheStrategy(CacheStrategy::InMemory);
       return DISCARD;
 
+    case KEY_NO_CACHE:
+      Reader::SetCacheStrategy(CacheStrategy::NoCache);
+      return DISCARD;
+
     case KEY_NO_MERGE:
       param.opts.merge = false;
       return DISCARD;
 
     case KEY_NO_TRIM:
       param.opts.trim = false;
-      return DISCARD;
-
-    case KEY_NO_CACHE:
-      Reader::SetCacheStrategy(CacheStrategy::NoCache);
       return DISCARD;
 
     case KEY_NO_DIRS:

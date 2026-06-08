@@ -62,13 +62,13 @@ working directory.
 **-o encoding=CHARSET**
 :   Original encoding of file names.
 
-**-o notrim**
-:   Do not trim the base of the tree. Keep all the intermediate directories as
-    specified in the ZIP archive(s).
-
 **-o nomerge**
 :   Do not merge multiple ZIP archives on top of each other. Instead, create a
     subdirectory for each ZIP archive inside the mount point.
+
+**-o notrim**
+:   Do not trim the base of the tree. Keep all the intermediate directories as
+    specified in the ZIP archive(s).
 
 **-o nodirs**
 :   No directories. Flatten the archive structure by presenting all its files in
