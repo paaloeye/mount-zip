@@ -41,6 +41,8 @@
 #include <unistd.h>
 #include <zip.h>
 
+#include <boost/functional/hash.hpp>
+
 #include "error.h"
 #include "extra_field.h"
 #include "file_descriptor.h"
