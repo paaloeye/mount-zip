@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include <cstring>
+#include <tuple>
 
 LogLevel g_log_level = LogLevel::INFO;
 
